@@ -685,8 +685,9 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn get_sandbox(&self, name: &str) -> Result<Option<Sandbox>, String> {
+        let sanitized_name = sanitize_k8s_name(name);
         info!(
-            sandbox_name = %name,
+            sandbox_name = %sanitized_name,
             namespace = %self.config.namespace,
             "Fetching sandbox from Kubernetes"
         );
@@ -694,7 +695,9 @@ impl KubernetesComputeDriver {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(&sanitized_name))
+            .await
+        {
             Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
                 debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
@@ -781,7 +784,7 @@ impl KubernetesComputeDriver {
         validate_gpu_request(gpu_requirements).map_err(|status| {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
-        let name = sandbox.name.as_str();
+        let name = sanitize_k8s_name(&sandbox.name);
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
@@ -834,7 +837,7 @@ impl KubernetesComputeDriver {
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
+        let mut obj = DynamicObject::new(&name, &agent_sandbox_api.resource);
         // Copy only the SCC-related annotations onto the Sandbox CR for
         // traceability. Copying the full namespace annotation map exposes
         // unrelated cluster metadata and can fail with oversized annotations.
@@ -850,7 +853,7 @@ impl KubernetesComputeDriver {
         })
         .collect();
         obj.metadata = ObjectMeta {
-            name: Some(name.to_string()),
+            name: Some(name.clone()),
             namespace: Some(self.config.namespace.clone()),
             labels: Some(sandbox_labels(sandbox)),
             annotations: if scc_annotations.is_empty() {
@@ -901,8 +904,9 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, String> {
+        let sanitized_name = sanitize_k8s_name(name);
         info!(
-            sandbox_name = %name,
+            sandbox_name = %sanitized_name,
             namespace = %self.config.namespace,
             "Deleting sandbox from Kubernetes"
         );
@@ -912,21 +916,23 @@ impl KubernetesComputeDriver {
             .await?;
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.delete(name, &DeleteParams::default()),
+            agent_sandbox_api
+                .api
+                .delete(&sanitized_name, &DeleteParams::default()),
         )
         .await
         {
             Ok(Ok(_response)) => {
-                info!(sandbox_name = %name, "Sandbox deleted from Kubernetes");
+                info!(sandbox_name = %sanitized_name, "Sandbox deleted from Kubernetes");
                 Ok(true)
             }
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
-                debug!(sandbox_name = %name, "Sandbox not found in Kubernetes (already deleted)");
+                debug!(sandbox_name = %sanitized_name, "Sandbox not found in Kubernetes (already deleted)");
                 Ok(false)
             }
             Ok(Err(err)) => {
                 warn!(
-                    sandbox_name = %name,
+                    sandbox_name = %sanitized_name,
                     error = %err,
                     "Failed to delete sandbox from Kubernetes"
                 );
@@ -2224,6 +2230,35 @@ fn sandbox_to_k8s_spec(
     Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
     ))
+}
+
+/// Sanitize a sandbox name to conform to Kubernetes RFC 1123 DNS label requirements.
+///
+/// RFC 1123 DNS labels must:
+/// - contain only lowercase alphanumeric characters or hyphens
+/// - start and end with an alphanumeric character
+/// - be at most 253 characters long but its more practical to limit it to the lower end
+///
+/// This function:
+/// - Converts uppercase letters to lowercase
+/// - Replaces underscores and invalid characters with hyphens
+/// - Trims leading and trailing hyphens
+/// - Truncates to 63 characters
+fn sanitize_k8s_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(63)
+        .collect()
 }
 
 #[cfg(test)]
@@ -5624,5 +5659,48 @@ mod tests {
         let vct = default_workspace_volume_claim_templates("");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn sanitize_k8s_name_converts_underscores_to_hyphens() {
+        assert_eq!(sanitize_k8s_name("my_sandbox"), "my-sandbox");
+    }
+
+    #[test]
+    fn sanitize_k8s_name_converts_to_lowercase() {
+        assert_eq!(sanitize_k8s_name("MySandbox"), "mysandbox");
+        assert_eq!(sanitize_k8s_name("TEST_SANDBOX"), "test-sandbox");
+    }
+
+    #[test]
+    fn sanitize_k8s_name_replaces_invalid_chars_with_hyphens() {
+        assert_eq!(sanitize_k8s_name("test@sandbox!"), "test-sandbox");
+        assert_eq!(sanitize_k8s_name("test#sandbox$"), "test-sandbox");
+    }
+
+    #[test]
+    fn sanitize_k8s_name_trims_leading_and_trailing_hyphens() {
+        assert_eq!(sanitize_k8s_name("-my-sandbox-"), "my-sandbox");
+        assert_eq!(sanitize_k8s_name("---test---"), "test");
+    }
+
+    #[test]
+    fn sanitize_k8s_name_preserves_valid_names() {
+        assert_eq!(sanitize_k8s_name("my-sandbox"), "my-sandbox");
+        assert_eq!(sanitize_k8s_name("test123"), "test123");
+    }
+
+    #[test]
+    fn sanitize_k8s_name_truncates_to_63_chars() {
+        let long_name = "a".repeat(100);
+        let result = sanitize_k8s_name(&long_name);
+        assert_eq!(result.len(), 63);
+        assert_eq!(result, "a".repeat(63));
+    }
+
+    #[test]
+    fn sanitize_k8s_name_preserves_double_hyphens() {
+        assert_eq!(sanitize_k8s_name("foo--bar"), "foo--bar");
+        assert_eq!(sanitize_k8s_name("my--sandbox--name"), "my--sandbox--name");
     }
 }
