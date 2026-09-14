@@ -7,6 +7,7 @@ pub(crate) mod destination;
 mod egress;
 mod relay;
 
+#[cfg(target_os = "linux")]
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
@@ -33,7 +34,8 @@ use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU32;
 use tokio::io::{
     AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
 };
@@ -90,10 +92,10 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
     ocsf_emit!(finding);
 }
 
-/// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
+/// Hostnames injected by compute drivers as hosts-file aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
 /// exemption when the resolved IP matches the driver-injected value read from
-/// `/etc/hosts` at proxy startup.
+/// the platform hosts file at proxy startup.
 const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.openshell.internal",
     "host.containers.internal",
@@ -136,6 +138,60 @@ pub struct ProxyHandle {
     exited_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
+#[derive(Clone)]
+pub(crate) enum ProxyIdentityMode {
+    /// Linux supervisor mode: bind a CONNECT request to the process that owns
+    /// the redirected TCP socket via procfs.
+    #[cfg(target_os = "linux")]
+    Procfs {
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
+    },
+    /// Host-side mode for platforms where procfs socket ownership is
+    /// unavailable. MXC uses this on Windows: every connection redirected to
+    /// the per-sandbox listener is evaluated as the configured sandbox agent
+    /// identity.
+    #[cfg(any(not(target_os = "linux"), test))]
+    Static {
+        binary_path: PathBuf,
+        binary_sha256: String,
+    },
+}
+
+impl ProxyIdentityMode {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn procfs(
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
+    ) -> Self {
+        Self::Procfs {
+            identity_cache,
+            entrypoint_pid,
+        }
+    }
+
+    #[cfg(any(not(target_os = "linux"), test))]
+    pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Result<Self> {
+        let binary_path = path.into();
+        let binary_sha256 = crate::procfs::file_sha256(&binary_path)?;
+        Ok(Self::Static {
+            binary_path,
+            binary_sha256,
+        })
+    }
+
+    fn entrypoint_pid(&self) -> u32 {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Procfs { entrypoint_pid, .. } => {
+                entrypoint_pid.load(std::sync::atomic::Ordering::Acquire)
+            }
+            #[cfg(any(not(target_os = "linux"), test))]
+            Self::Static { .. } => 0,
+        }
+    }
+}
+
 impl ProxyHandle {
     /// Start the proxy with OPA engine for policy evaluation.
     ///
@@ -146,8 +202,7 @@ impl ProxyHandle {
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
-        identity_cache: Arc<BinaryIdentityCache>,
-        entrypoint_pid: Arc<AtomicU32>,
+        identity_mode: Arc<ProxyIdentityMode>,
         tls_state: Option<Arc<ProxyTlsState>>,
         provider_credentials: Option<ProviderCredentialState>,
         policy_local_ctx: Option<Arc<PolicyLocalContext>>,
@@ -183,14 +238,14 @@ impl ProxyHandle {
             ocsf_emit!(event);
         }
 
-        // Detect the trusted host gateway IP from /etc/hosts before user code
-        // runs. This is read once at startup so later /etc/hosts modifications
-        // by sandbox workloads cannot influence the stored value.
+        // Detect the trusted host gateway IP from the platform hosts file
+        // before user code runs. This is read once at startup so later hosts
+        // file modifications by sandbox workloads cannot influence it.
         let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
         if let Some(ref ip) = *trusted_host_gateway {
             tracing::info!(
                 %ip,
-                "Trusted host gateway detected from /etc/hosts; \
+                "Trusted host gateway detected from platform hosts file; \
                  host-gateway aliases exempt from SSRF always-blocked check"
             );
         }
@@ -277,8 +332,7 @@ impl ProxyHandle {
                         consecutive_unknown_errors = 0;
                         set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
-                        let cache = identity_cache.clone();
-                        let spid = entrypoint_pid.clone();
+                        let identity = identity_mode.clone();
                         let tls = tls_state.clone();
                         let policy_local = policy_local_ctx.clone();
                         let proposals = agent_proposals.clone();
@@ -300,8 +354,7 @@ impl ProxyHandle {
                             if let Err(err) = handle_tcp_connection(
                                 stream,
                                 opa,
-                                cache,
-                                spid,
+                                identity,
                                 tls,
                                 policy_local,
                                 proposals,
@@ -523,7 +576,7 @@ async fn handle_transparent_tcp_connection(
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
     let decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &engine, &cache, &pid, intent)
+        authorize_egress_intent_procfs(connection, &engine, &cache, &pid, intent)
     })
     .await
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
@@ -1583,8 +1636,7 @@ async fn deny_forward_destination(
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
-    identity_cache: Arc<BinaryIdentityCache>,
-    entrypoint_pid: Arc<AtomicU32>,
+    identity_mode: Arc<ProxyIdentityMode>,
     tls_state: Option<Arc<ProxyTlsState>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
@@ -1655,8 +1707,7 @@ async fn handle_tcp_connection(
             used,
             &mut client,
             opa_engine,
-            identity_cache,
-            entrypoint_pid,
+            identity_mode,
             policy_local_ctx,
             agent_proposals,
             trusted_host_gateway,
@@ -1681,11 +1732,10 @@ async fn handle_tcp_connection(
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
     let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
+    let identity_clone = identity_mode.clone();
     let intent = EgressIntent::connect(host_lc.clone(), port);
     let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        authorize_egress_intent(connection, &opa_clone, &identity_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -1803,7 +1853,7 @@ async fn handle_tcp_connection(
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
 
-    let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let sandbox_entrypoint_pid = identity_mode.entrypoint_pid();
 
     match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
         Ok(()) => {}
@@ -2477,7 +2527,7 @@ fn resolve_process_identity(
 
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
-fn authorize_egress_intent(
+fn authorize_egress_intent_procfs(
     connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
@@ -2650,33 +2700,71 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
     }
 }
 
-/// Non-Linux stub: OPA identity binding requires /proc.
-#[cfg(not(target_os = "linux"))]
 fn authorize_egress_intent(
-    _connection: crate::procfs::WorkloadProxyTcpConnection,
+    connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
-    _identity_cache: &BinaryIdentityCache,
-    _entrypoint_pid: &AtomicU32,
+    identity_mode: &ProxyIdentityMode,
     intent: EgressIntent,
 ) -> EgressDecision {
+    #[cfg(not(target_os = "linux"))]
+    let _ = &connection;
+
     if !crate::opa::network_binary_identity_required() {
         return evaluate_endpoint_only_opa(engine, intent);
     }
 
-    EgressDecision {
-        intent,
-        action: NetworkAction::Deny {
-            reason: "identity binding unavailable on this platform".into(),
-        },
-        policy_generation: engine.current_generation(),
-        identity: ProcessIdentityEvidence::Unavailable(
-            IdentityUnavailableReason::UnsupportedPlatform,
+    match identity_mode {
+        #[cfg(target_os = "linux")]
+        ProxyIdentityMode::Procfs {
+            identity_cache,
+            entrypoint_pid,
+        } => authorize_egress_intent_procfs(
+            connection,
+            engine,
+            identity_cache,
+            entrypoint_pid,
+            intent,
         ),
-        endpoint: EndpointDecision::default(),
-        binary: None,
-        binary_pid: None,
-        ancestors: vec![],
-        cmdline_paths: vec![],
+        #[cfg(any(not(target_os = "linux"), test))]
+        ProxyIdentityMode::Static {
+            binary_path,
+            binary_sha256,
+        } => {
+            let input = crate::opa::NetworkInput {
+                host: intent.destination.host.clone(),
+                port: intent.destination.port,
+                binary_path: binary_path.clone(),
+                binary_sha256: binary_sha256.clone(),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            };
+            match engine.authorize_egress(&input) {
+                Ok(authorization) => EgressDecision {
+                    intent,
+                    action: authorization.action.clone(),
+                    policy_generation: authorization.generation,
+                    identity: ProcessIdentityEvidence::Available,
+                    endpoint: EndpointDecision::from_authorization(&authorization),
+                    binary: Some(binary_path.clone()),
+                    binary_pid: None,
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                },
+                Err(error) => EgressDecision {
+                    intent,
+                    action: NetworkAction::Deny {
+                        reason: format!("policy evaluation error: {error}"),
+                    },
+                    policy_generation: engine.current_generation(),
+                    identity: ProcessIdentityEvidence::Available,
+                    endpoint: EndpointDecision::default(),
+                    binary: Some(binary_path.clone()),
+                    binary_pid: None,
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                },
+            }
+        }
     }
 }
 
@@ -2929,16 +3017,27 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Read the proxy's own `/etc/hosts` at startup and return the IP mapped to
+/// Read the proxy's own platform hosts file at startup and return the IP mapped to
 /// `host.openshell.internal`, if present and safe.
 ///
 /// This is called once before user code runs, so the returned value is immune
-/// to later `/etc/hosts` tampering by sandbox workloads. Returns `None` if no
-/// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
-/// metadata address.
-#[cfg(any(target_os = "linux", test))]
+/// to later hosts-file tampering by sandbox workloads. Returns `None` if the
+/// hosts file cannot be read, no entry exists, the entry cannot be parsed, or
+/// the mapped IP is a cloud metadata address.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
-    let contents = std::fs::read_to_string("/etc/hosts").ok()?;
+    let hosts_path = platform_hosts_path();
+    let contents = match std::fs::read_to_string(&hosts_path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            warn!(
+                path = %hosts_path.display(),
+                %error,
+                "failed to read platform hosts file; trusted-gateway SSRF exemption disabled"
+            );
+            return None;
+        }
+    };
     let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
 
     // Multiple distinct IPs for the alias is unexpected — compute drivers
@@ -2950,7 +3049,7 @@ pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     if ips.len() > 1 {
         warn!(
             ips = ?ips,
-            "host.openshell.internal has {} distinct IPs in /etc/hosts; \
+            "host.openshell.internal has {} distinct IPs in the platform hosts file; \
              expected exactly one. Using first entry. \
              Connections resolving to any other IP will be rejected.",
             ips.len()
@@ -2984,9 +3083,36 @@ pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     Some(ip)
 }
 
-#[cfg(not(any(target_os = "linux", test)))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", test)))]
 pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     None
+}
+
+#[cfg(target_os = "linux")]
+fn platform_hosts_path() -> PathBuf {
+    PathBuf::from("/etc/hosts")
+}
+
+#[cfg(target_os = "windows")]
+fn platform_hosts_path() -> PathBuf {
+    windows_hosts_path_from_system_root(std::env::var("SystemRoot").ok().as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hosts_path_from_system_root(system_root: Option<&str>) -> PathBuf {
+    let root = system_root
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(r"C:\Windows");
+    PathBuf::from(root)
+        .join("System32")
+        .join("drivers")
+        .join("etc")
+        .join("hosts")
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
+fn platform_hosts_path() -> PathBuf {
+    PathBuf::from("/etc/hosts")
 }
 
 /// Resolve `host:port` and validate that every resolved address matches the
@@ -3055,7 +3181,7 @@ fn resolve_ip_literal(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
         .map(|ip| vec![SocketAddr::new(ip, port)])
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn parse_hosts_file_for_host(contents: &str, host: &str) -> Vec<IpAddr> {
     let lookup_host = normalize_host_lookup_key(host);
     let mut addrs = Vec::new();
@@ -4080,8 +4206,7 @@ async fn handle_forward_proxy(
     used: usize,
     client: &mut TcpStream,
     opa_engine: Arc<OpaEngine>,
-    identity_cache: Arc<BinaryIdentityCache>,
-    entrypoint_pid: Arc<AtomicU32>,
+    identity_mode: Arc<ProxyIdentityMode>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
@@ -4187,11 +4312,10 @@ async fn handle_forward_proxy(
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
     let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
+    let identity_clone = identity_mode.clone();
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
     let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        authorize_egress_intent(connection, &opa_clone, &identity_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -4282,7 +4406,7 @@ async fn handle_forward_proxy(
         action = ?decision.action,
         "Forward proxy L4 policy decision"
     );
-    let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let sandbox_entrypoint_pid = identity_mode.entrypoint_pid();
     let forward_generation_guard = match relay::pin_policy_generation(
         &opa_engine,
         decision.policy_generation,
@@ -5665,6 +5789,9 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use openshell_core::proposals::AgentProposals;
+    use openshell_core::proto::{
+        NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy,
+    };
     use std::collections::HashMap as TestHashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
@@ -5838,8 +5965,7 @@ network_policies: {}
         Box::pin(handle_tcp_connection(
             server,
             engine,
-            Arc::new(BinaryIdentityCache::new()),
-            Arc::new(AtomicU32::new(std::process::id())),
+            Arc::new(ProxyIdentityMode::static_binary(std::env::current_exe().unwrap()).unwrap()),
             None,
             None,
             AgentProposals::default(),
@@ -5980,6 +6106,15 @@ network_policies:
                 response
             });
             let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+            #[cfg(target_os = "linux")]
+            let identity_mode = Arc::new(ProxyIdentityMode::procfs(
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+            ));
+            #[cfg(not(target_os = "linux"))]
+            let identity_mode = Arc::new(
+                ProxyIdentityMode::static_binary(executable.clone()).expect("hash test executable"),
+            );
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -5990,8 +6125,7 @@ network_policies:
                     request.len(),
                     &mut proxy_connection,
                     engine,
-                    Arc::new(BinaryIdentityCache::new()),
-                    Arc::new(AtomicU32::new(std::process::id())),
+                    identity_mode,
                     None,
                     AgentProposals::default(),
                     Arc::new(None),
@@ -6104,8 +6238,9 @@ network_policies:
                 request.len(),
                 &mut proxy_connection,
                 engine,
-                Arc::new(BinaryIdentityCache::new()),
-                Arc::new(AtomicU32::new(std::process::id())),
+                Arc::new(
+                    ProxyIdentityMode::static_binary(std::env::current_exe().unwrap()).unwrap(),
+                ),
                 None,
                 AgentProposals::default(),
                 Arc::new(None),
@@ -6237,8 +6372,9 @@ network_policies:
                 request.len(),
                 &mut proxy_connection,
                 engine,
-                Arc::new(BinaryIdentityCache::new()),
-                Arc::new(AtomicU32::new(std::process::id())),
+                Arc::new(
+                    ProxyIdentityMode::static_binary(std::env::current_exe().unwrap()).unwrap(),
+                ),
                 None,
                 AgentProposals::default(),
                 Arc::new(None),
@@ -6804,6 +6940,97 @@ network_policies:
             classify_tunnel_protocol(b"SSH-2.0-OpenSSH\r\n"),
             TunnelProtocol::Unsupported
         );
+    }
+
+    #[test]
+    fn static_binary_hashes_configured_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"abc").unwrap();
+
+        match ProxyIdentityMode::static_binary(tmp.path()).unwrap() {
+            ProxyIdentityMode::Static {
+                binary_path,
+                binary_sha256,
+            } => {
+                assert_eq!(binary_path, tmp.path());
+                assert_eq!(
+                    binary_sha256,
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+            }
+            #[cfg(target_os = "linux")]
+            ProxyIdentityMode::Procfs { .. } => panic!("expected static identity mode"),
+        }
+    }
+
+    #[test]
+    fn static_identity_evaluate_opa_tcp_allows_and_denies_with_proto_policy() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"static-agent").unwrap();
+        let identity = ProxyIdentityMode::static_binary(tmp.path()).unwrap();
+        let binary_path = tmp.path().to_string_lossy().into_owned();
+        let policy_name = "static_agent";
+        let engine = OpaEngine::from_proto(&ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                policy_name.to_string(),
+                NetworkPolicyRule {
+                    name: policy_name.to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.test".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary { path: binary_path }],
+                },
+            )]),
+            ..Default::default()
+        })
+        .unwrap();
+        let peer_addr: SocketAddr = ([127, 0, 0, 1], 49152).into();
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(
+            peer_addr,
+            ([127, 0, 0, 1], 18080).into(),
+        );
+
+        let allowed = authorize_egress_intent(
+            connection,
+            &engine,
+            &identity,
+            EgressIntent::connect("api.example.test".to_string(), 443),
+        );
+        match allowed.action {
+            NetworkAction::Allow { matched_policy } => {
+                assert_eq!(matched_policy.as_deref(), Some(policy_name));
+            }
+            NetworkAction::Deny { reason } => panic!("expected allow, got deny: {reason}"),
+        }
+        assert_eq!(allowed.binary.as_deref(), Some(tmp.path()));
+        assert_eq!(allowed.binary_pid, None);
+        assert!(allowed.ancestors.is_empty());
+        assert!(allowed.cmdline_paths.is_empty());
+
+        let denied = authorize_egress_intent(
+            connection,
+            &engine,
+            &identity,
+            EgressIntent::connect("blocked.example.test".to_string(), 443),
+        );
+        match denied.action {
+            NetworkAction::Allow { matched_policy } => {
+                panic!("expected deny, got allow from policy {matched_policy:?}");
+            }
+            NetworkAction::Deny { reason } => {
+                assert!(
+                    reason.contains("endpoint blocked.example.test:443 is not allowed"),
+                    "unexpected deny reason: {reason}"
+                );
+            }
+        }
+        assert_eq!(denied.binary.as_deref(), Some(tmp.path()));
+        assert_eq!(denied.binary_pid, None);
+        assert!(denied.ancestors.is_empty());
+        assert!(denied.cmdline_paths.is_empty());
     }
 
     #[test]
@@ -10835,8 +11062,7 @@ network_policies:
         });
 
         let (server, _peer) = listener.accept().await.unwrap();
-        let entrypoint_pid = Arc::new(AtomicU32::new(std::process::id()));
-        let cache = Arc::new(BinaryIdentityCache::new());
+        let identity_mode = Arc::new(ProxyIdentityMode::static_binary(exe).unwrap());
         let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
 
         let completed = tokio::time::timeout(
@@ -10844,8 +11070,7 @@ network_policies:
             Box::pin(handle_tcp_connection(
                 server,
                 engine,
-                cache,
-                entrypoint_pid,
+                identity_mode,
                 None,                      // tls_state — ephemeral CA unavailable
                 None,                      // policy_local_ctx
                 AgentProposals::default(), // agent_proposals
@@ -10881,15 +11106,15 @@ network_policies:
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         let exe = std::env::current_exe().expect("current_exe");
+        let exe_yaml = serde_json::to_string(&exe.to_string_lossy()).expect("serialize exe path");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{exe}" }}
+      - {{ path: {exe_yaml} }}
 "#,
-            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 
@@ -10910,8 +11135,7 @@ network_policies:
         Box::pin(handle_tcp_connection(
             server,
             engine,
-            Arc::new(BinaryIdentityCache::new()),
-            Arc::new(AtomicU32::new(std::process::id())),
+            Arc::new(ProxyIdentityMode::static_binary(exe).unwrap()),
             None,
             None,
             AgentProposals::default(),
