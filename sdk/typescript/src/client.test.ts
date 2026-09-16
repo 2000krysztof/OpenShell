@@ -72,7 +72,12 @@ function selectsAllWorkspaces(req: ScopedRequest): boolean {
 
 describe('exec / execStream', () => {
   it('resolves the id via get, frames tty:false, and buffers the result (backward compat)', async () => {
-    let execReq: { sandboxId?: string; tty?: boolean; command?: string[] } = {};
+    let execReq: {
+      sandboxId?: string;
+      tty?: boolean;
+      command?: string[];
+      executionTimeout?: { seconds: bigint; nanos: number };
+    } = {};
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),
       // eslint-disable-next-line require-yield
@@ -89,10 +94,25 @@ describe('exec / execStream', () => {
     expect(execReq.sandboxId).toBe('sb-id-1');
     expect(execReq.tty).toBe(false);
     expect(execReq.command).toEqual(['/bin/sh', '-c', 'echo hi']);
+    expect(execReq.executionTimeout).toBeUndefined();
     expect(result.exitCode).toBe(3);
     expect(result.stdout.toString()).toBe('hello world');
     expect(result.stderr.toString()).toBe('warn');
     expect(Buffer.isBuffer(result.stdout)).toBe(true);
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid timeoutSecs %s', async (timeoutSecs) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+
+    await expect(sandbox.exec('sb', ['true'], { timeoutSecs })).rejects.toThrow(
+      'timeoutSecs must be a finite, non-negative number',
+    );
   });
 
   it('execStream yields incremental chunks then a terminal exit event', async () => {
@@ -1129,7 +1149,7 @@ describe('ssh sessions', () => {
         gatewayPort: 8443,
         gatewayScheme: 'https',
         hostKeyFingerprint: 'SHA256:abc',
-        expiresAtMs: 1730000000000n,
+        expirationTime: { seconds: 1730000000n, nanos: 0 },
       }),
     });
     const session = await withExpiry.createSshSession('sb');
@@ -1152,7 +1172,7 @@ describe('ssh sessions', () => {
         gatewayPort: 80,
         gatewayScheme: 'http',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
     });
     const bare = await noExpiry.createSshSession('sb');
@@ -1173,7 +1193,7 @@ describe('ssh sessions', () => {
       gatewayPort: 8443,
       gatewayScheme: 'https',
       hostKeyFingerprint: 'SHA256:abc',
-      expiresAtMs: 0n,
+      expirationTime: undefined,
     };
     const cases: Array<Record<string, unknown>> = [
       { ...base, sandboxId: 'different-sandbox' },
@@ -1207,7 +1227,7 @@ describe('ssh sessions', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         }),
       });
       await expect(sandbox.createSshSession('sb')).resolves.toMatchObject({ gatewayHost });
@@ -1231,7 +1251,7 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       revokeSshSession: (req) => {
@@ -1314,7 +1334,7 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
       revokeSshSession: () => ({ revoked: true }),
       // Ignore inbound frames; just blast a large, verifiable byte stream back.
@@ -1375,7 +1395,7 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       // biome-ignore lint/correctness/useYield: the socket is reset before any frame is relayed
@@ -1445,7 +1465,7 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
       forwardTcp: async function* (_requests, ctx) {
         streamStarted();

@@ -362,10 +362,13 @@ Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
 generates these types separately, so the public descriptor set and the Rust,
 Go, Python, and TypeScript client generation inputs do not advertise them.
+When a frozen scalar storage field cannot distinguish absence from its zero
+value, gateway-owned object metadata annotations carry that presence bit rather
+than extending the frozen message.
 
 | Storage classification | Protobuf messages | Durable use |
 |---|---|---|
-| Encoded storage roots | `StoredProviderCredentialRefreshState`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. |
+| Encoded storage roots | `StoredProviderCredentialRefreshStateV2`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. The frozen V1 refresh state remains available only for transactional upgrade decoding. |
 | Nested storage-only type | `StoredRefreshMaterialDeletion` | Repeated child records inside provider refresh state. |
 | SQL materializations | `StoredPolicyRevision`, `StoredDraftChunk` | Server-only typed results assembled from indexed columns and decoded payloads; not public RPC messages. |
 | Public messages used directly as encoded storage roots | `Sandbox`, `SandboxWorkloadTemplate`, `Provider`, `Workspace`, `WorkspaceMember`, `SshSession`, `ServiceEndpoint` | The generated public type is also the persisted payload. `SshSession` is not in the current public RPC message closure. |
@@ -444,6 +447,19 @@ scope semantics.
 For in-memory SQLite, the adapter retains a dedicated keepalive connection for
 the store lifetime. Operational connection replacement therefore preserves the
 shared in-memory schema and objects instead of creating an empty database.
+
+Public protobuf APIs represent absolute times with `google.protobuf.Timestamp`
+and elapsed time with `google.protobuf.Duration`. The integer
+`created_at_ms` and `updated_at_ms` database columns are intentionally internal
+bookkeeping values, not part of that public convention. On startup, both
+storage backends transactionally rewrite legacy scalar time fields inside
+protobuf payloads before serving requests. A malformed affected payload aborts
+and rolls back startup migration. Legacy driver-provided condition strings that
+cannot be represented as timestamps are dropped so an accepted historical
+value cannot make the upgraded gateway unavailable.
+Gateway and Sandbox Protocol token responses follow the same convention: a
+present expiration timestamp carries the absolute deadline, while absence means
+the issued token does not expire.
 
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
