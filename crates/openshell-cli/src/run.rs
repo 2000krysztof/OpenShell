@@ -21,7 +21,7 @@ pub use crate::commands::gateway::{
     gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_use,
 };
 
-use crate::commands::provider::inferred_provider_type;
+use crate::commands::provider::fetch_provider_profile_catalog;
 pub use crate::commands::provider::{
     ProviderCreateCredentialSource, ProviderCreateOptions, ProviderRefreshConfigInput,
     ProviderUpdateOptions, ensure_required_providers, provider_create,
@@ -448,6 +448,7 @@ pub struct SandboxCreateConfig<'a> {
     pub approval_mode: &'a str,
     pub output: &'a str,
     pub detach: bool,
+    pub suppress_credential_warnings: bool,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -474,6 +475,7 @@ impl Default for SandboxCreateConfig<'_> {
             approval_mode: "manual",
             output: "table",
             detach: false,
+            suppress_credential_warnings: false,
         }
     }
 }
@@ -508,6 +510,7 @@ pub async fn sandbox_create(
         approval_mode,
         output,
         detach,
+        suppress_credential_warnings,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -541,6 +544,15 @@ pub async fn sandbox_create(
     })?;
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
+
+    // Provider profiles are import-only, so the catalog lives on the gateway.
+    // Its only consumer is the credential warning, which is advisory: an
+    // unreachable catalog degrades the warning to its generic form rather than
+    // blocking sandbox creation. Nothing else derives authority from it.
+    let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
+        .await
+        .unwrap_or_default();
+    warn_credential_env_vars(&environment, &profile_catalog, suppress_credential_warnings);
 
     if template.is_some()
         && (from.is_some()
@@ -576,15 +588,9 @@ pub async fn sandbox_create(
             None => (None, None),
         }
     };
-    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
-    let configured_providers = ensure_required_providers(
-        &mut client,
-        providers,
-        &inferred_types,
-        auto_providers_override,
-        workspace,
-    )
-    .await?;
+    let configured_providers =
+        ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
+            .await?;
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = if template.is_none() {
@@ -2663,6 +2669,7 @@ pub async fn sandbox_template_create(
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
+    suppress_credential_warnings: bool,
 ) -> Result<()> {
     let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
         Some(SandboxResources {
@@ -2685,6 +2692,10 @@ pub async fn sandbox_template_create(
     let desired_service_level = build_template_service_level(ready_within, max_burst)?;
 
     let mut client = grpc_client(server, tls).await?;
+    let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
+        .await
+        .unwrap_or_default();
+    warn_credential_env_vars(&environment, &profile_catalog, suppress_credential_warnings);
     let response = client
         .create_sandbox_template(CreateSandboxTemplateRequest {
             request_id: String::new(),
