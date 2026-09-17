@@ -1923,6 +1923,31 @@ fn normalize_l7_rule_aliases(
             );
         }
     }
+
+    // MCP tool aliases must move into params before matcher normalization so
+    // both authored forms produce the same endpoint configuration as protobuf.
+    normalize_l7_matcher_map(rule, "query");
+    normalize_l7_matcher_map(rule, "params");
+}
+
+/// Normalize nonempty matcher leaves to the protobuf runtime representation.
+///
+/// OPA data also accepts explicit `glob` and `any` objects. Keeping those intact
+/// makes normalization idempotent for already lowered data and protobuf reloads.
+fn normalize_l7_matcher_map(rule: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
+    let Some(matchers) = rule
+        .get_mut(field)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for matcher in matchers.values_mut() {
+        // Rego permits an empty scalar to match an empty query value, whereas
+        // an empty glob object never matches. Preserve this OPA-only form.
+        if matcher.as_str().is_some_and(|glob| !glob.is_empty()) {
+            *matcher = serde_json::json!({ "glob": matcher.take() });
+        }
+    }
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching
@@ -3365,6 +3390,607 @@ mod tests {
             .expect("expected object")
             .clone()
         );
+    }
+
+    fn assert_endpoint_config_parity(
+        yaml_config: &serde_json::Value,
+        proto_config: &serde_json::Value,
+        canonical_policy: &ProtoSandboxPolicy,
+        endpoint: &NetworkEndpoint,
+    ) {
+        assert!(yaml_config.get("endpoint_id").is_none());
+        assert!(yaml_config.get("policy_hash").is_none());
+        let mut expected = yaml_config.clone();
+        if is_mcp_protocol(&endpoint.protocol) {
+            // Gateway MCP observations carry canonical endpoint/policy identity.
+            // Derive only that metadata independently; compare every remaining
+            // configuration field without filtering actual runtime output.
+            expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
+            expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
+            assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
+            assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
+        } else {
+            assert!(proto_config.get("endpoint_id").is_none());
+            assert!(proto_config.get("policy_hash").is_none());
+        }
+        assert_eq!(
+            &expected, proto_config,
+            "{}: endpoint configuration must match apart from verified gateway identity",
+            endpoint.protocol
+        );
+    }
+
+    #[test]
+    fn yaml_and_proto_loads_have_protocol_config_and_authorization_parity() {
+        let data = r#"
+version: 1
+network_policies:
+  parity:
+    name: parity
+    endpoints:
+      - host: rest.parity.test
+        port: 443
+        path: /items/**
+        protocol: rest
+        enforcement: enforce
+        allow_encoded_slash: true
+        rules:
+          - allow: { method: GET, path: /items/** }
+      - host: graphql.parity.test
+        port: 443
+        path: /graphql
+        protocol: graphql
+        enforcement: enforce
+        graphql_max_body_bytes: 65536
+        rules:
+          - allow:
+              operation_type: query
+              operation_name: GetWidget
+              fields: [id, name]
+      - host: websocket.parity.test
+        port: 443
+        path: /graphql
+        protocol: websocket
+        enforcement: enforce
+        websocket_credential_rewrite: true
+        rules:
+          - allow: { method: GET, path: /graphql }
+          - allow:
+              operation_type: subscription
+              fields: [messageAdded]
+      - host: jsonrpc.parity.test
+        port: 443
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc: { max_body_bytes: 32768 }
+        rules:
+          - allow: { method: status.get }
+      - host: mcp.parity.test
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          max_body_bytes: 16384
+          strict_tool_names: false
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto = openshell_policy::parse_sandbox_policy(data)
+            .expect("protocol parity fixture must parse into the typed schema");
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
+            .expect("protocol parity fixture must canonicalize");
+        let yaml_engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from YAML");
+        let proto_engine = OpaEngine::from_proto(&proto).expect("engine from protobuf");
+
+        let cases = [
+            (
+                "REST",
+                "rest.parity.test",
+                l7_input("rest.parity.test", 443, "GET", "/items/one"),
+                l7_input("rest.parity.test", 443, "DELETE", "/items/one"),
+            ),
+            (
+                "GraphQL",
+                "graphql.parity.test",
+                l7_graphql_input(
+                    "graphql.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "query",
+                        "operation_name": "GetWidget",
+                        "fields": ["id"],
+                        "persisted_query": false
+                    }]),
+                ),
+                l7_graphql_input(
+                    "graphql.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "mutation",
+                        "operation_name": "DeleteWidget",
+                        "fields": ["id"],
+                        "persisted_query": false
+                    }]),
+                ),
+            ),
+            (
+                "WebSocket",
+                "websocket.parity.test",
+                l7_websocket_graphql_input(
+                    "websocket.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "subscription",
+                        "fields": ["messageAdded"],
+                        "persisted_query": false
+                    }]),
+                ),
+                l7_websocket_graphql_input(
+                    "websocket.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "subscription",
+                        "fields": ["adminAuditLog"],
+                        "persisted_query": false
+                    }]),
+                ),
+            ),
+            (
+                "JSON-RPC",
+                "jsonrpc.parity.test",
+                l7_jsonrpc_input("jsonrpc.parity.test", 443, "/rpc", "status.get"),
+                l7_jsonrpc_input("jsonrpc.parity.test", 443, "/rpc", "status.delete"),
+            ),
+            (
+                "MCP",
+                "mcp.parity.test",
+                l7_jsonrpc_input_with_params(
+                    "mcp.parity.test",
+                    443,
+                    "/mcp",
+                    "tools/call",
+                    serde_json::json!({ "name": "read_status" }),
+                ),
+                l7_jsonrpc_input_with_params(
+                    "mcp.parity.test",
+                    443,
+                    "/mcp",
+                    "tools/call",
+                    serde_json::json!({ "name": "delete_status" }),
+                ),
+            ),
+        ];
+
+        for (protocol, host, allowed, denied) in cases {
+            let network_input = NetworkInput {
+                host: host.to_string(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".to_string(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let yaml_config = yaml_engine
+                .query_endpoint_config(&network_input)
+                .expect("query YAML endpoint config")
+                .unwrap_or_else(|| panic!("{protocol}: expected YAML endpoint config"));
+            let proto_config = proto_engine
+                .query_endpoint_config(&network_input)
+                .expect("query protobuf endpoint config")
+                .unwrap_or_else(|| panic!("{protocol}: expected protobuf endpoint config"));
+            let yaml_config: serde_json::Value = serde_json::from_str(
+                &yaml_config
+                    .to_json_str()
+                    .expect("YAML endpoint config must serialize"),
+            )
+            .expect("YAML endpoint config must be JSON");
+            let proto_config: serde_json::Value = serde_json::from_str(
+                &proto_config
+                    .to_json_str()
+                    .expect("protobuf endpoint config must serialize"),
+            )
+            .expect("protobuf endpoint config must be JSON");
+
+            let endpoint = proto.network_policies["parity"]
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.host == host)
+                .expect("fixture contains the exact endpoint");
+            assert_endpoint_config_parity(&yaml_config, &proto_config, &proto, endpoint);
+            assert_eq!(
+                yaml_config.get("mcp_versions").is_some(),
+                protocol == "MCP",
+                "{protocol}: only MCP endpoints carry revision state"
+            );
+            assert!(
+                eval_l7(&yaml_engine, &allowed) && eval_l7(&proto_engine, &allowed),
+                "{protocol}: equivalent allowed request must pass both ingress formats"
+            );
+            assert!(
+                !eval_l7(&yaml_engine, &denied) && !eval_l7(&proto_engine, &denied),
+                "{protocol}: equivalent denied request must fail both ingress formats"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload() {
+        // Exercise allow and deny matchers through both public loaders. The
+        // denied request also matches the allow rule, proving deny precedence.
+        for (protocol, selector, allowed, denied) in [
+            (
+                "rest",
+                "query",
+                serde_json::json!({"name": ["read_status"]}),
+                serde_json::json!({"name": ["read_secret"]}),
+            ),
+            (
+                "mcp",
+                "params",
+                serde_json::json!({"name": "read_status"}),
+                serde_json::json!({"name": "read_secret"}),
+            ),
+        ] {
+            let method = if protocol == "mcp" {
+                "tools/call"
+            } else {
+                "GET"
+            };
+            let path = if protocol == "rest" { "path: /**" } else { "" };
+            let deny_matcher = if protocol == "rest" {
+                "\"read_sec*\""
+            } else {
+                "{any: [read_secret, read_private]}"
+            };
+            let source = format!(
+                r#"
+version: 1
+network_policies:
+  matchers:
+    name: matchers
+    endpoints:
+      - host: matchers.parity.test
+        port: 443
+        protocol: {protocol}
+        enforcement: enforce
+        rules:
+          - allow:
+              method: {method}
+              {path}
+              {selector}: {{name: "read_*"}}
+        deny_rules:
+          - method: {method}
+            {path}
+            {selector}: {{name: {deny_matcher}}}
+    binaries:
+      - {{path: /usr/bin/curl}}
+"#
+            );
+            let mut proto =
+                openshell_policy::parse_sandbox_policy(&source).expect("authored policy");
+            let endpoint = &mut proto
+                .network_policies
+                .get_mut("matchers")
+                .unwrap()
+                .endpoints[0];
+            endpoint.provider_credentialed = true;
+            endpoint.advisor_proposed = true;
+            let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
+                .expect("runtime provenance fixture must canonicalize");
+            let mut data: serde_json::Value = serde_yml::from_str(&source).unwrap();
+            let endpoint = &mut data["network_policies"]["matchers"]["endpoints"][0];
+            endpoint["provider_credentialed"] = true.into();
+            endpoint["advisor_proposed"] = true.into();
+            // Versionless data and runtime provenance are accepted OPA inputs.
+            data.as_object_mut().unwrap().remove("version");
+            let yaml_engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string()).unwrap();
+            let proto_engine = OpaEngine::from_proto(&proto).unwrap();
+            let input = NetworkInput {
+                host: "matchers.parity.test".into(),
+                port: 443,
+                binary_path: "/usr/bin/curl".into(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let request = |value| {
+                if protocol == "mcp" {
+                    l7_jsonrpc_input_with_params(&input.host, 443, "/", method, value)
+                } else {
+                    l7_input_with_query(&input.host, 443, method, "/", value)
+                }
+            };
+            let allowed = request(allowed);
+            let denied = request(denied);
+            let normalized = preprocess_yaml_data(&data.to_string(), true, None).unwrap();
+            assert_eq!(
+                normalized,
+                preprocess_yaml_data(&normalized, true, None).unwrap()
+            );
+
+            for phase in ["startup", "reload"] {
+                if phase == "reload" {
+                    yaml_engine.reload(TEST_POLICY, &normalized).unwrap();
+                    proto_engine.reload_from_proto(&proto).unwrap();
+                }
+                let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap().unwrap();
+                let proto_config = proto_engine.query_endpoint_config(&input).unwrap().unwrap();
+                assert_endpoint_config_parity(
+                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
+                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
+                    &proto,
+                    &proto.network_policies["matchers"].endpoints[0],
+                );
+                for engine in [&yaml_engine, &proto_engine] {
+                    let snapshot = engine.authorize_egress(&input).unwrap();
+                    assert_eq!(snapshot.generation, u64::from(phase == "reload"));
+                    assert_eq!(
+                        yaml_config["provider_credentialed"],
+                        regorus::Value::Bool(true)
+                    );
+                    assert_eq!(yaml_config["advisor_proposed"], regorus::Value::Bool(true));
+                    assert!(eval_l7(engine, &allowed), "{protocol} {phase}: allow");
+                    assert!(
+                        !eval_l7(engine, &denied),
+                        "{protocol} {phase}: deny takes precedence"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity() {
+        // SQL policy classification is audit-only. Check its rule decisions
+        // here without claiming that the proxy enforces SQL commands.
+        for (protocol, fields) in [
+            (
+                "sql",
+                "enforcement: audit\n        rules: [{allow: {command: SELECT}}]",
+            ),
+            ("tcp", ""),
+            ("", ""),
+        ] {
+            let source = format!(
+                r#"
+version: 1
+network_policies:
+  parity:
+    name: parity
+    endpoints:
+      - host: sql-l4.parity.test
+        port: 443
+        protocol: "{protocol}"
+        {fields}
+    binaries:
+      - {{path: /usr/bin/curl}}
+"#
+            );
+            let proto = openshell_policy::parse_sandbox_policy(&source).unwrap();
+            let yaml_engine = OpaEngine::from_strings(TEST_POLICY, &source).unwrap();
+            let proto_engine = OpaEngine::from_proto(&proto).unwrap();
+            let mut input = NetworkInput {
+                host: "sql-l4.parity.test".into(),
+                port: 443,
+                binary_path: "/usr/bin/curl".into(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            assert_eq!(
+                yaml_engine.query_endpoint_config(&input).unwrap(),
+                proto_engine.query_endpoint_config(&input).unwrap()
+            );
+            for engine in [&yaml_engine, &proto_engine] {
+                assert!(matches!(
+                    engine.evaluate_network_action(&input).unwrap(),
+                    NetworkAction::Allow { .. }
+                ));
+                if protocol == "sql" {
+                    let config = engine.query_endpoint_config(&input).unwrap().unwrap();
+                    assert_eq!(config["enforcement"], regorus::Value::from("audit"));
+                    let mut request = l7_input(&input.host, 443, "", "/");
+                    request["request"]["command"] = "SELECT".into();
+                    assert!(eval_l7(engine, &request));
+                    request["request"]["command"] = "DELETE".into();
+                    assert!(!eval_l7(engine, &request));
+                }
+            }
+            input.host = "unlisted.parity.test".into();
+            for engine in [&yaml_engine, &proto_engine] {
+                assert!(matches!(
+                    engine.evaluate_network_action(&input).unwrap(),
+                    NetworkAction::Deny { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_mcp_params_maps_preserve_denials_and_reject_malformed_reload() {
+        let valid = serde_json::json!({
+            "network_policies": {
+                "tools": {
+                    "endpoints": [{
+                        "host": "mcp.params.test",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "enforcement": "enforce",
+                        "rules": [{"allow": {"method": "tools/call", "tool": "read_*"}}],
+                        "deny_rules": [{"method": "tools/call", "tool": "read_secret"}]
+                    }],
+                    "binaries": [{"path": "/usr/bin/curl"}]
+                }
+            }
+        });
+        let request = |name: &str| {
+            l7_jsonrpc_input_with_params(
+                "mcp.params.test",
+                443,
+                "/mcp",
+                "tools/call",
+                serde_json::json!({"name": name}),
+            )
+        };
+        let allowed = request("read_status");
+        let denied = request("read_secret");
+
+        for yaml in [true, false] {
+            let encode = |data: &serde_json::Value| {
+                if yaml {
+                    serde_yml::to_string(data).expect("serialize YAML policy")
+                } else {
+                    data.to_string()
+                }
+            };
+            let engine = OpaEngine::from_strings(TEST_POLICY, &encode(&valid))
+                .expect("omitted params must preserve tool aliases");
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+            let generation = engine.current_generation();
+
+            // Every raw rule shape must reject before normalization can remove
+            // an alias. Failed reloads must leave both allow and deny intact.
+            for (rule_pointer, flat_allow, diagnostic) in [
+                (
+                    "/rules/0/allow",
+                    false,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/rules/0",
+                    true,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/deny_rules/0",
+                    false,
+                    "deny_rules[0].params: expected map of matchers",
+                ),
+            ] {
+                for params in [
+                    serde_json::Value::Null,
+                    serde_json::json!([]),
+                    serde_json::json!("invalid"),
+                    serde_json::json!(false),
+                    serde_json::json!(42),
+                ] {
+                    let mut candidate = valid.clone();
+                    let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                    if flat_allow {
+                        endpoint["rules"][0] = endpoint["rules"][0]["allow"].take();
+                    }
+                    endpoint
+                        .pointer_mut(rule_pointer)
+                        .expect("fixture rule exists")["params"] = params;
+                    // The validator identifies the malformed field internally;
+                    // public load errors must redact authored policy details.
+                    let (errors, _) = crate::l7::validate_l7_policies(&candidate);
+                    assert!(
+                        errors.iter().any(|error| error.contains(diagnostic)),
+                        "{errors:?}"
+                    );
+                    let source = encode(&candidate);
+                    let error = OpaEngine::from_strings(TEST_POLICY, &source)
+                        .err()
+                        .expect("non-map params must reject at startup");
+                    // A malformed rule may produce multiple safe categories.
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("invalid L7 policy configuration"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
+                    let error = engine
+                        .reload(TEST_POLICY, &source)
+                        .expect_err("non-map params must reject on reload");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("invalid L7 policy configuration"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
+                    assert_eq!(engine.current_generation(), generation);
+                    assert!(eval_l7(&engine, &allowed));
+                    assert!(!eval_l7(&engine, &denied));
+                }
+            }
+
+            // Empty maps accept alias insertion; explicit name maps retain the
+            // same selector without an alias. Neither form may erase a deny.
+            for explicit_name in [false, true] {
+                let mut candidate = valid.clone();
+                let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                for pointer in ["/rules/0/allow", "/deny_rules/0"] {
+                    let rule = endpoint.pointer_mut(pointer).expect("fixture rule exists");
+                    rule["params"] = if explicit_name {
+                        let tool = rule.as_object_mut().expect("rule map").remove("tool");
+                        serde_json::json!({"name": tool.expect("fixture tool selector")})
+                    } else {
+                        serde_json::json!({})
+                    };
+                }
+                let source = encode(&candidate);
+                let control = OpaEngine::from_strings(TEST_POLICY, &source)
+                    .expect("valid matcher map must load");
+                assert!(eval_l7(&control, &allowed));
+                assert!(!eval_l7(&control, &denied));
+                let previous_generation = engine.current_generation();
+                engine
+                    .reload(TEST_POLICY, &source)
+                    .expect("valid matcher map must reload after rejection");
+                assert_eq!(engine.current_generation(), previous_generation + 1);
+                assert!(eval_l7(&engine, &allowed));
+                assert!(!eval_l7(&engine, &denied));
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_empty_query_matcher_retains_deny_semantics_across_reload() {
+        // Empty scalar matchers are OPA-only: an empty protobuf glob has no
+        // presence and is rejected. Rego strings can still match empty input.
+        let source = r#"
+network_policies:
+  empty_query:
+    name: empty_query
+    endpoints:
+      - host: empty.parity.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
+        deny_rules:
+          - method: GET
+            path: /**
+            query: {name: ""}
+    binaries:
+      - {path: /usr/bin/curl}
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, source).unwrap();
+        for phase in ["startup", "reload"] {
+            if phase == "reload" {
+                engine.reload(TEST_POLICY, source).unwrap();
+            }
+            for (value, allowed) in [("", false), ("present", true)] {
+                let request = l7_input_with_query(
+                    "empty.parity.test",
+                    443,
+                    "GET",
+                    "/",
+                    serde_json::json!({"name": [value]}),
+                );
+                assert_eq!(
+                    eval_l7(&engine, &request),
+                    allowed,
+                    "{phase}: name={value:?}"
+                );
+            }
+        }
     }
 
     const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
