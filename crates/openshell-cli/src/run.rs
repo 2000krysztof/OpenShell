@@ -1173,7 +1173,16 @@ pub async fn sandbox_create(
         SandboxPhase::Error => {
             drop(stream);
             drop(client);
-            let create_result = if last_error_reason.is_empty() {
+            let provisioning_timed_out = last_sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.provisioning.as_ref())
+                .is_some_and(|record| record.timeout_time.is_some());
+            let create_result = if provisioning_timed_out {
+                Err(miette::miette!(
+                    "{last_error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; repair its configuration, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+                ))
+            } else if last_error_reason.is_empty() {
                 Err(miette::miette!(
                     "sandbox entered error phase while provisioning"
                 ))
@@ -1186,7 +1195,12 @@ pub async fn sandbox_create(
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
-                persist,
+                persist
+                    || last_sandbox
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.provisioning.as_ref())
+                        .is_some_and(|record| record.timeout_time.is_some()),
                 create_result,
                 workspace,
                 &effective_tls,
@@ -1567,11 +1581,23 @@ where
         sandbox.object_id().to_string()
     };
 
-    let config = client
+    let config_result = client
         .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
-        .await
-        .into_diagnostic()?
-        .into_inner();
+        .await;
+    let config = match config_result {
+        Ok(response) => response.into_inner(),
+        Err(_) if !policy_only && configuration_failure_message(&sandbox).is_some() => {
+            // An invalid desired policy must not hide the status needed to
+            // repair it. Keep payload-only reads strict.
+            GetSandboxConfigResponse {
+                configuration_error: configuration_failure_message(&sandbox)
+                    .unwrap_or_default()
+                    .to_string(),
+                ..Default::default()
+            }
+        }
+        Err(error) => return Err(error).into_diagnostic(),
+    };
 
     if policy_only {
         let Some(ref policy) = config.policy else {
@@ -1605,6 +1631,22 @@ where
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(status) = sandbox.status.as_ref() {
+        for condition in &status.conditions {
+            if matches!(
+                condition.r#type.as_str(),
+                "ConfigurationReady" | "DesiredConfigurationReady"
+            ) && condition.status.eq_ignore_ascii_case("false")
+            {
+                println!(
+                    "  {} {}: {}",
+                    "Configuration:".dimmed(),
+                    condition.reason,
+                    condition.message
+                );
+            }
+        }
+    }
     if let Some(exit_code) = sandbox.status.as_ref().and_then(|status| status.exit_code) {
         println!("  {} {}", "Exit Code:".dimmed(), exit_code);
     }
@@ -2467,7 +2509,19 @@ pub async fn sandbox_list(
     Ok(())
 }
 
+fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
+    sandbox
+        .status
+        .as_ref()?
+        .configuration_admission
+        .as_ref()
+        .map(|admission| admission.error.as_str())
+        .filter(|message| !message.is_empty())
+}
+
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
+    use openshell_core::proto::ConfigurationAdmissionState;
+
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
     let annotations = meta.map_or_else(
@@ -2507,6 +2561,37 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             })
             .collect::<Vec<_>>()
     });
+    let admission = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .map(|admission| {
+            serde_json::json!({
+                "state": match ConfigurationAdmissionState::try_from(admission.state) {
+                    Ok(ConfigurationAdmissionState::Pending) => "pending",
+                    Ok(ConfigurationAdmissionState::Accepted) => "accepted",
+                    Ok(ConfigurationAdmissionState::Rejected) => "rejected",
+                    _ => "unknown",
+                },
+                "error": admission.error,
+                "policy_version": admission.policy_version,
+                "policy_hash": admission.policy_hash,
+                "config_revision": admission.config_revision,
+                "provider_env_revision": admission.provider_env_revision,
+            })
+        });
+    let provisioning = sandbox.status.as_ref().and_then(|status| status.provisioning.as_ref())
+        .map(|record| serde_json::json!({
+            "attempt_id": record.attempt_id,
+            "configuration_change_id": record.configuration_change_id,
+            "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
+            "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "deadline": record.deadline.as_ref().map(ToString::to_string),
+            "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
+            "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
+            "cleanup_error": record.cleanup_error,
+            "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+        }));
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2520,6 +2605,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
+        "configuration_admission": admission,
+        "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
     })
 }
@@ -7363,6 +7450,69 @@ mod tests {
         let json = super::sandbox_template_to_json(&template);
 
         assert_eq!(json["resources"]["gpu"], 2);
+    }
+
+    #[test]
+    fn provisioning_json_exposes_deadline_and_cleanup_separately() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Error.into());
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                attempt_id: "attempt".into(),
+                timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+                cleanup_error: "Compute reclamation is pending; the gateway will retry".into(),
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["attempt_id"], "attempt");
+        assert!(json["provisioning"]["deadline"].is_null());
+        assert!(json["provisioning"]["cleanup_completed_time"].is_null());
+        assert_eq!(json["provisioning"]["timeout_time"], "1970-01-01T00:05:00Z");
+        assert!(
+            json["provisioning"]["cleanup_error"]
+                .as_str()
+                .unwrap()
+                .contains("pending")
+        );
+    }
+
+    #[test]
+    fn sandbox_json_exposes_repair_diagnostic_and_accepted_generation() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let status = sandbox.status.as_mut().unwrap();
+        status.configuration_admission = Some(SandboxConfigurationAdmission {
+            state: ConfigurationAdmissionState::Rejected as i32,
+            error: "rule image_api requires L7 inspection".to_string(),
+            policy_hash: "candidate-hash".to_string(),
+            ..Default::default()
+        });
+        status.conditions.push(SandboxCondition {
+            r#type: "ConfigurationReady".to_string(),
+            status: "False".to_string(),
+            reason: "ConfigurationInvalid".to_string(),
+            message: "rule image_api requires L7 inspection".to_string(),
+            ..Default::default()
+        });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["configuration_admission"]["state"], "rejected");
+        assert_eq!(json["conditions"][0]["reason"], "ConfigurationInvalid");
+        assert_eq!(
+            super::configuration_failure_message(&sandbox),
+            Some("rule image_api requires L7 inspection")
+        );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .error
+            .clear();
+        assert_eq!(super::configuration_failure_message(&sandbox), None);
     }
 
     #[test]

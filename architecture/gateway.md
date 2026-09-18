@@ -436,6 +436,29 @@ and number; this coordinated pre-1.0 API change does not alter durable schemas.
 The outcome alone does not provide request deduplication. Opted-in unary methods
 require a request UUID for the admission contract.
 
+Configuration admission adds `SandboxStatus.configuration_admission` at field
+11 and optional `configuration_activated` at field 12, extending the public and
+durable closures. New sandboxes explicitly store `false` until first acceptance;
+acceptance stores `true` permanently, including across restart. Legacy rows
+have neither field and conservatively retain static-policy restrictions. No
+database rewrite is required. A pre-admission byte fixture verifies that legacy
+phase and policy-version fields survive without fabricated admission or activation.
+`SandboxStatus.provisioning` uses field 13 for gateway-owned attempt timing and
+compute reclamation progress. Its timestamps survive supervisor reconnects and
+ordinary driver status updates. Older records decode with no provisioning
+record; timing must be adopted once and persisted, never reconstructed from the
+object's frequently changing update timestamp. The additive message requires
+no rewrite of existing payloads and leaves the frozen storage-v1 schema intact.
+Stored settings JSON also carries per-key change IDs and commit timestamps,
+including deletion tombstones. Legacy values acquire stable source identities
+on read; a subsequent write preserves them. These clocks distinguish effective
+edits from no-op writes without treating status updates as configuration edits.
+With timestamp types, deletion outcomes, and optional mutation request IDs, the
+admission contract brings the public closure to 298 messages and 21 enums, the
+durable closure to 92 messages and 16 enums, and their overlap to 80 messages
+and 16 enums. Mutation request IDs extend public request fields without adding
+messages to these closures or changing the durable protobuf schema.
+
 | Dual-purpose encoded root | Current decision |
 |---|---|
 | `Sandbox` | Defer a storage twin; govern its complete dependency closure as durable. |
