@@ -94,8 +94,13 @@ grpcurl \
 ```
 
 Reflection advertises only `openshell.v1.OpenShell`. It does not advertise
-internal driver, interceptor, or middleware services. Callback-only
-compute-driver listeners do not serve reflection.
+internal driver, interceptor, or middleware services.
+
+When the gateway gRPC rate limit is enabled, reflection uses a separate counter
+with the same request count and window. Opening the reflection RPC consumes one
+gateway-wide request, and every query sent through that stream consumes one
+reflection counter unit. Exceeding the reflection quota closes the stream with
+`RESOURCE_EXHAUSTED`.
 
 ### OIDC
 
