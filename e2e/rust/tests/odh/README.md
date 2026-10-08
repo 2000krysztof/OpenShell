@@ -363,6 +363,11 @@ The deploy script refuses to replace an existing namespace unless
 `openshell.nvidia.com/deployed-by=odh-e2e` label. Failed deployments are
 cleaned up only when a state marker confirms this script created the
 namespace. SIGTERM is forwarded through the phase runner before teardown.
+Before a managed phase, the entrypoint snapshots namespaces labelled for the
+test gateway. It removes only matching namespaces that were absent from that
+snapshot, including after test failure or termination, before tearing down the
+gateway namespace. This cleanup relies on the documented no-overlapping-runs
+constraint until upstream managed tests support a run-specific gateway identity.
 The kubeconfig must permit
 namespace creation, Helm deployment, and the OpenShift operations used by
 the tests. Set `OPENSHELL_E2E_DEPLOY_GATEWAY=0` only when a single-phase tier

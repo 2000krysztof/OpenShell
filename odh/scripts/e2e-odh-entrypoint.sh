@@ -75,11 +75,52 @@ done
 merged_report="${results_dir}/e2e-odh-${TIER}.xml"
 rm -f "${merged_report}" "${merged_report%.xml}.html"
 
+managed_namespace_selector='openshell.ai/managed-by=openshell,openshell.ai/gateway-id=openshell'
+snapshot_managed_namespaces() {
+	local snapshot_file="$1"
+	local temporary_file="${snapshot_file}.tmp"
+	if ! oc get namespaces -l "${managed_namespace_selector}" -o name > "${temporary_file}"; then
+		rm -f -- "${temporary_file}"
+		return 1
+	fi
+	mv -- "${temporary_file}" "${snapshot_file}"
+}
+cleanup_managed_namespaces() {
+	local state_dir="$1"
+	local baseline_file="${state_dir}/managed-namespaces-before"
+	local current_file="${state_dir}/managed-namespaces-current"
+	local resource namespace cleanup_status=0
+	[[ -f "${baseline_file}" ]] || return 0
+	if ! oc get namespaces -l "${managed_namespace_selector}" -o name > "${current_file}"; then
+		echo "ERROR: could not list managed-workspace namespaces for cleanup" >&2
+		return 1
+	fi
+	while IFS= read -r resource; do
+		[[ -n "${resource}" ]] || continue
+		if grep -Fqx -- "${resource}" "${baseline_file}"; then
+			continue
+		fi
+		namespace="${resource#namespace/}"
+		if [[ "${namespace}" == "${resource}" || -z "${namespace}" ]]; then
+			echo "ERROR: unexpected namespace resource from oc: ${resource}" >&2
+			cleanup_status=1
+			continue
+		fi
+		echo ">> Removing managed-workspace namespace '${namespace}' created during this phase"
+		oc delete namespace "${namespace}" --ignore-not-found --wait=false || cleanup_status=1
+	done < "${current_file}"
+	return "${cleanup_status}"
+}
+
 cleanup() {
 	local result=$?
 	trap - EXIT
 	trap '' INT TERM
 	if [[ -n "${active_state}" ]]; then
+		if ! cleanup_managed_namespaces "${active_state}"; then
+			echo "ERROR: managed-workspace namespace cleanup failed" >&2
+			[[ "${result}" != 0 ]] || result=1
+		fi
 		if [[ -f "${active_state}/namespace" ]]; then
 			teardown_args=(teardown --yes --mode "${active_mode}")
 			if [[ ! -f "${active_state}/gateway" ]]; then teardown_args+=(--keep-local-gateway); fi
@@ -121,6 +162,7 @@ for phase_line in ${phase_lines}; do
 	phase_report="${phase_reports[phase_index]}"
 	phase_deploy_status=0
 	phase_test_status=0
+	phase_managed_cleanup_status=0
 	teardown_failed=0
 	if [[ "${deploy_enabled}" != 0 ]]; then
 		active_state="$(mktemp -d)"
@@ -134,11 +176,23 @@ for phase_line in ${phase_lines}; do
 		fi
 	fi
 	if [[ "${phase_deploy_status}" == 0 ]]; then
-		run_child "${TEST_SCRIPT}" "${TIER}" "${phase}" "${phase_report}" || phase_test_status=$?
+		if [[ -n "${active_state}" && "${mode}" == managed ]]; then
+			if ! snapshot_managed_namespaces "${active_state}/managed-namespaces-before"; then
+				echo "ERROR: could not snapshot managed-workspace namespaces before ${TIER}/${phase}" >&2
+				phase_test_status=1
+			fi
+		fi
+		if [[ "${phase_test_status}" == 0 ]]; then
+			run_child "${TEST_SCRIPT}" "${TIER}" "${phase}" "${phase_report}" || phase_test_status=$?
+		fi
 	else
 		echo "ERROR: deployment/preflight failed for ${TIER}/${phase} (${phase_deploy_status})" >&2
 	fi
 	if [[ -n "${active_state}" ]]; then
+		if ! cleanup_managed_namespaces "${active_state}"; then
+			echo "ERROR: managed-workspace namespace cleanup failed for ${TIER}/${phase}" >&2
+			phase_managed_cleanup_status=1
+		fi
 		if [[ -f "${active_state}/namespace" ]]; then
 			teardown_args=(teardown --yes --mode "${mode}")
 			if [[ ! -f "${active_state}/gateway" ]]; then teardown_args+=(--keep-local-gateway); fi
@@ -158,6 +212,7 @@ for phase_line in ${phase_lines}; do
 	fi
 	if [[ "${status}" == 0 && "${phase_deploy_status}" != 0 ]]; then status="${phase_deploy_status}"; fi
 	if [[ "${status}" == 0 && "${phase_test_status}" != 0 ]]; then status="${phase_test_status}"; fi
+	if [[ "${status}" == 0 && "${phase_managed_cleanup_status}" != 0 ]]; then status="${phase_managed_cleanup_status}"; fi
 	if [[ "${teardown_failed}" == 1 ]]; then break; fi
 	((phase_index+=1))
 done
