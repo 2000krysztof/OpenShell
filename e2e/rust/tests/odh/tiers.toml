@@ -13,11 +13,11 @@ workspace_namespace_managed = [
 ]
 
 [modes.shared]
-expected_helm_values = { server = { auth = { allowUnauthenticatedUsers = false }, drivers = { kubernetes = { workspaceMode = "shared" } } } }
+expected_helm_values = { gatewayConfig = { "openshell.gateway.auth" = { allow_unauthenticated_users = false }, "openshell.drivers.kubernetes" = { workspace_mode = "shared", image_pull_policy = "IfNotPresent", sandbox_runtime_image_pull_policy = "IfNotPresent", supervisor_image_pull_policy = "IfNotPresent" } } }
 
 [modes.managed]
 helm_values = ["deploy/helm/openshell/ci/values-workspace-managed.yaml"]
-expected_helm_values = { server = { auth = { allowUnauthenticatedUsers = false }, drivers = { kubernetes = { workspaceMode = "managed" } } } }
+expected_helm_values = { gatewayConfig = { "openshell.gateway.auth" = { allow_unauthenticated_users = false }, "openshell.drivers.kubernetes" = { workspace_mode = "managed", image_pull_policy = "IfNotPresent", sandbox_runtime_image_pull_policy = "IfNotPresent", supervisor_image_pull_policy = "IfNotPresent" } } }
 
 [smoke]
 description = "Component-level critical tests (5 min target)"

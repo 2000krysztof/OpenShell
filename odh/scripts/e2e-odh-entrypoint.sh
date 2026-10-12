@@ -6,6 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export OPENSHELL_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 PLAN_RESOLVER="${ROOT}/e2e/rust/tests/odh/tier_plan.py"
 TIERS_FILE="${ROOT}/e2e/rust/tests/odh/tiers.toml"
 DEPLOY_SCRIPT="${OPENSHELL_E2E_DEPLOY_SCRIPT:-${SCRIPT_DIR}/openshell-deploy-from-quay.sh}"
