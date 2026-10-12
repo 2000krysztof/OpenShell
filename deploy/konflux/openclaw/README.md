@@ -158,7 +158,7 @@ The npm inputs come from AIPCC agentic commit dc756bc3 (OpenClaw 2026.9.5). AIPC
 
 ## Konflux
 
-odh-konflux-central owns the Tekton pipelines. Its onboarder sync opens a PR here that copies `pipelineruns/openshell/odh-openshell-sandbox-openclaw-*.yaml` over `.tekton/`, so change their params there and run the sync. Merges to `main` publish `odh-stable`, and each `v*-rhaiv.*` tag rebuilds the same pinned OpenClaw release under that tag; only the commit named in [Status](#status) is verified. The build is hermetic for linux/x86_64 and linux/arm64 with this prefetch input:
+This image is versioned after OpenClaw. Merges to `main` publish `odh-stable`; consumers should pin by digest for reproducible deployments, or use `odh-stable` for the latest build. The build is hermetic for linux/x86_64 and linux/arm64 with this prefetch input:
 
 ```json
 [{"type": "npm", "path": "deploy/konflux/openclaw"}, {"type": "rpm", "path": "deploy/konflux/openclaw"}]
