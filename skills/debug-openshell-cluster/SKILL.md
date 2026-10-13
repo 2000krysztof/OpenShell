@@ -107,6 +107,14 @@ preserving namespace metadata. Use the published
 [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md)
 for the installation entry point. Diagnose Agent Sandbox availability separately;
 the installer does not provision that controller or RHOAI itself.
+Its read-only preflight checks storage, installation permissions, and recorded
+OIDC identities across installer-managed namespaces. Distinct gateways need
+distinct audiences and browser clients. Legacy state without OIDC metadata needs
+manual review; retained history for another uninstalled release is not an active
+gateway. Operational values files are reapplied on every upgrade; authentication,
+TLS, naming, and namespace overrides are rejected. The deployment guide also
+provides a read-only verifier for admin/ordinary-user workspace authorization;
+it does not establish browser login, sandbox lifecycle, or network-policy enforcement.
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 

@@ -1,5 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 OpenShell contributors
 # SPDX-License-Identifier: Apache-2.0
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["PyYAML==6.0.3"]
+# ///
 """Behavioral tests with a simulated cluster; no network or cluster access."""
 
 import base64
@@ -38,9 +42,38 @@ class FakeCluster(installer.Installer):
         self.calls = []
         self.releases = []
         self.fail_dashboard = False
+        self.storage = [
+            {
+                "metadata": {
+                    "name": "block",
+                    "annotations": {
+                        "storageclass.kubernetes.io/is-default-class": "true"
+                    },
+                }
+            }
+        ]
+        self.other_states = []
+        self.denied_permission = None
 
     def run(self, args, payload=None):
         self.calls.append((args, payload))
+        if "can-i" in args:
+            return (
+                "no"
+                if self.denied_permission and self.denied_permission in args
+                else "yes"
+            )
+        if "storageclasses" in args:
+            return json.dumps({"items": self.storage})
+        if "nodes" in args:
+            return json.dumps({"items": []})
+        if "--all-namespaces" in args:
+            return json.dumps({"items": self.other_states})
+        if "patch" in args:
+            self.objects[("configmap", installer.INSTALL_STATE)]["data"].update(
+                json.loads(args[args.index("-p") + 1])["data"]
+            )
+            return ""
         if args[:2] == ["helm", "list"]:
             offset = int(args[args.index("--offset") + 1])
             return json.dumps(self.releases[offset : offset + 256])
@@ -98,7 +131,14 @@ class InstallTests(unittest.TestCase):
         return FakeCluster(self.load())
 
     def test_rejects_unpinned_versions_and_unknown_keys(self):
-        for version in ("latest", "0.0.0", "0.2.1", ">=0.1.0", "REPLACE_ME"):
+        for version in (
+            "latest",
+            "0.0.0",
+            "01.2.3",
+            "1.2.3-01",
+            ">=0.1.0",
+            "REPLACE_ME",
+        ):
             with self.subTest(version=version):
                 self.config["gateway"]["version"] = version
                 with self.assertRaises(ValueError):
@@ -108,11 +148,170 @@ class InstallTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown"):
             self.load()
 
+    def test_pinned_downstream_and_new_release_versions(self):
+        for version in ("0.0.0-dev.e7fdd6b", "0.2.1", "1.2.3+rhaiv.5"):
+            self.config["gateway"]["version"] = version
+            self.assertEqual(self.load()["gateway"]["version"], version)
+
+    def test_yaml_overlays_merge_in_order_and_preserve_managed_values(self):
+        (self.root / "base.yaml").write_text(
+            "resources:\n  requests:\n    cpu: 100m\n    memory: 256Mi\n"
+        )
+        (self.root / "site.yaml").write_text(
+            "resources:\n  requests:\n    cpu: 200m\nimagePullSecrets:\n  - name: registry-creds\n"
+        )
+        self.config["gateway"]["values_files"] = ["base.yaml", "site.yaml"]
+        self.config["oidc"]["scope"] = "openid email profile offline_access"
+        gateway, dashboard = installer.chart_values(self.load())
+        self.assertEqual(
+            gateway["resources"]["requests"], {"cpu": "200m", "memory": "256Mi"}
+        )
+        self.assertEqual(gateway["imagePullSecrets"], [{"name": "registry-creds"}])
+        self.assertEqual(
+            gateway["server"]["sandboxNamespace"], self.config["namespace"]
+        )
+        self.assertEqual(
+            dashboard["oidc"]["scope"], "openid email profile offline_access"
+        )
+
+    def test_overlays_cannot_replace_authentication_or_namespace_contract(self):
+        for name, overlay in (
+            ("gateway", "server:\n  auth:\n    allowUnauthenticatedUsers: true"),
+            ("gateway", "server: null"),
+            ("gateway", "fullnameOverride: foreign"),
+            ("dashboard", "authProxy:\n  extraArgs: [--skip-auth-regex=.*]"),
+            ("dashboard", "networkPolicy:\n  enabled: false"),
+            ("dashboard", "oidc:\n  existingSecret: foreign"),
+        ):
+            with self.subTest(overlay=overlay):
+                self.config = configuration()
+                (self.root / "site.yaml").write_text(overlay)
+                self.config[name]["values_files"] = ["site.yaml"]
+                with self.assertRaises(ValueError):
+                    self.load()
+
+    def test_scope_and_system_namespace_validation(self):
+        for scope in (None, [], "profile email", "openid\nemail"):
+            self.config["oidc"]["scope"] = scope
+            with self.assertRaises(ValueError):
+                self.load()
+        self.config = configuration()
+        for ns in ("default", "openshift", "openshift-ingress", "kube-system"):
+            self.config["namespace"] = ns
+            with self.assertRaisesRegex(ValueError, "system namespace"):
+                self.load()
+
+    def test_preflight_storage_and_permissions_fail_before_mutation(self):
+        for issue in ("storage", "permission", "workspace-storage"):
+            cluster = self.cluster()
+            if issue == "storage":
+                cluster.storage = []
+            elif issue == "permission":
+                cluster.denied_permission = "deployments.apps"
+            else:
+                cluster.config["gateway"]["values"] = {
+                    "server": {"workspaceStorageClass": "missing"}
+                }
+            with self.subTest(issue=issue), self.assertRaises(ValueError):
+                cluster.install([], [])
+            self.assertFalse(
+                any(
+                    "create" in args and "can-i" not in args
+                    for args, _ in cluster.calls
+                )
+            )
+            self.assertFalse(
+                any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
+            )
+
+    def test_cross_namespace_identity_reuse_is_rejected(self):
+        for field in ("oidc-audience", "oidc-client-id"):
+            cluster = self.cluster()
+            other = {
+                **cluster.identity_state(),
+                "oidc-audience": "other-api",
+                "oidc-client-id": "other-browser",
+            }
+            other[field] = cluster.identity_state()[field]
+            cluster.other_states = [
+                {
+                    "metadata": {"name": installer.INSTALL_STATE, "namespace": "other"},
+                    "data": other,
+                }
+            ]
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "distinct per-gateway"),
+            ):
+                cluster.preflight()
+        cluster.other_states[0]["data"]["oidc-issuer"] = (
+            "https://another-issuer.example"
+        )
+        cluster.preflight()
+
+    def test_identity_change_requires_migration(self):
+        cluster = self.cluster()
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        cluster.config["oidc"]["audience"] = "different-api"
+        with self.assertRaisesRegex(ValueError, "identity.*changed"):
+            cluster.preflight()
+
+    def test_uninstalled_other_release_history_does_not_block_install(self):
+        cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+        cluster.releases = [
+            {
+                "name": "retired-gateway",
+                "chart": "helm-chart-0.1.3",
+                "status": "uninstalled",
+            }
+        ]
+        cluster.preflight()
+        cluster.objects[("secret", "openshell-server-tls")] = {"data": {}}
+        with self.assertRaisesRegex(ValueError, "explicit migration"):
+            cluster.preflight()
+
+    def test_preflight_rejects_credential_drift_without_changing_state(self):
+        cluster = self.cluster()
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        before = copy.deepcopy(cluster.objects)
+        Path(cluster.config["oidc"]["client_secret_file"]).write_text("changed")
+        cluster.calls.clear()
+        with self.assertRaisesRegex(ValueError, "rotate"):
+            cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertEqual(cluster.objects, before)
+        self.assertFalse(
+            any("patch" in args and "can-i" not in args for args, _ in cluster.calls)
+        )
+
+    def test_preflight_mode_renders_and_checks_without_installing(self):
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+
+        def run(_instance, args, payload=None):
+            self.assertIsNone(payload)
+            if args[:2] == ["helm", "pull"]:
+                (Path(args[args.index("--destination") + 1]) / "chart.tgz").write_bytes(
+                    b"fake"
+                )
+            return ""
+
+        with (
+            patch("sys.argv", ["install.py", "--config", str(path), "--preflight"]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            patch.object(installer.Installer, "run", run),
+            patch.object(installer.Installer, "preflight") as preflight,
+            patch.object(installer.Installer, "install") as install,
+        ):
+            installer.main()
+        preflight.assert_called_once()
+        install.assert_not_called()
+
     def test_rejects_invalid_oidc_and_namespace(self):
         for section, key, value in (
             ("oidc", "issuer", "http://issuer.example"),
             ("oidc", "issuer", "https://user:password@issuer.example"),
-            ("oidc", "audience", "openshell-dashboard"),
+            ("oidc", "audience", configuration()["oidc"]["client_id"]),
             ("oidc", "allowed_roles", ["admin"]),
             ("gateway", "host", "gateway..example"),
         ):
@@ -162,7 +361,7 @@ class InstallTests(unittest.TestCase):
         for args, payload in cluster.calls:
             if args[:2] == ["helm", "upgrade"]:
                 self.assertEqual(args[args.index("--namespace") + 1], "research-team")
-            if "create" in args:
+            if "create" in args and "can-i" not in args:
                 resource = json.loads(payload)
                 self.assertNotEqual(resource["kind"], "Namespace")
                 self.assertEqual(resource["metadata"]["namespace"], "research-team")
@@ -204,7 +403,8 @@ class InstallTests(unittest.TestCase):
                     cluster.install([], [])
                 self.assertFalse(
                     any(
-                        "create" in args or args[:2] == ["helm", "upgrade"]
+                        ("create" in args and "can-i" not in args)
+                        or args[:2] == ["helm", "upgrade"]
                         for args, _ in cluster.calls
                     )
                 )
@@ -264,7 +464,9 @@ class InstallTests(unittest.TestCase):
         cluster.objects.clear()
         with self.assertRaisesRegex(ValueError, "Agent Sandbox"):
             cluster.install([], [])
-        self.assertFalse(any("create" in args for args, _ in cluster.calls))
+        self.assertFalse(
+            any("create" in args and "can-i" not in args for args, _ in cluster.calls)
+        )
 
     def test_install_order_context_and_secret_transport(self):
         cluster = self.cluster()
@@ -294,7 +496,9 @@ class InstallTests(unittest.TestCase):
         cluster.calls.clear()
         cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
         self.assertEqual(cluster.objects[("secret", installer.OIDC_SECRET)], before)
-        self.assertFalse(any("create" in args for args, _ in cluster.calls))
+        self.assertFalse(
+            any("create" in args and "can-i" not in args for args, _ in cluster.calls)
+        )
 
     def test_changed_gateway_host_requires_certificate_migration(self):
         cluster = self.cluster()
@@ -304,7 +508,10 @@ class InstallTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "certificate migration"):
             cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
         self.assertFalse(
-            any(args[0] == "helm" or "create" in args for args, _ in cluster.calls)
+            any(
+                args[0] == "helm" or ("create" in args and "can-i" not in args)
+                for args, _ in cluster.calls
+            )
         )
 
     def test_different_secret_is_not_silently_rotated(self):

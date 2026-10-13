@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["PyYAML==6.0.3"]
 # ///
 """Install the gateway and dashboard as separate Helm releases on OpenShift."""
 
 import argparse
 import base64
+import copy
 import json
 import os
 import re
@@ -21,14 +22,76 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import yaml
+
 OWNER = "openshell.ai/installer"
 OWNER_VALUE = "odh-dashboard"
 GATEWAY_HOST = "openshell.ai/installer-gateway-host"
 INSTALL_STATE = "openshell-installer"
 OIDC_SECRET = "openshell-dashboard-oidc"
 OIDC_CA = "openshell-oidc-ca"
-VERSION = re.compile(r"0\.1\.[0-9]+(?:-[0-9A-Za-z.-]+)?")
+VERSION = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 DNS = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+
+# Expose operational chart settings without allowing overlays to replace the
+# installer's identity, TLS, service naming, or namespace contract.
+COMMON_VALUES = dict.fromkeys(
+    ("resources", "nodeSelector", "tolerations", "affinity", "imagePullSecrets")
+)
+EXTRA_VALUES = {
+    "gateway": {
+        **COMMON_VALUES,
+        "server": dict.fromkeys(
+            (
+                "workspaceStorageClass",
+                "workspaceDefaultStorageSize",
+                "defaultRuntimeClassName",
+                "sandboxImagePullSecrets",
+            )
+        ),
+        "openshiftRoute": {"annotations": None},
+    },
+    "dashboard": {
+        **COMMON_VALUES,
+        "authProxy": {
+            "resources": None,
+            "cookie": {"refresh": None},
+            "upstreamTimeout": None,
+        },
+        "networkPolicy": {"ingressNamespace": None, "ingressFrom": None},
+        "openshiftRoute": {"annotations": None},
+    },
+}
+
+
+def merge_values(target, overlay, allowed, prefix=""):
+    require(isinstance(overlay, dict), f"{prefix or 'Values'} must be a mapping")
+    for key, value in overlay.items():
+        require(
+            key in allowed, f"Unsupported or installer-owned Helm value: {prefix}{key}"
+        )
+        if allowed[key] is not None:
+            merge_values(
+                target.setdefault(key, {}), value, allowed[key], f"{prefix}{key}."
+            )
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            # Helm's map merge semantics; arrays/scalars are replaced.
+            merge_unrestricted(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
+def merge_unrestricted(target, overlay):
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            merge_unrestricted(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
 
 
 def require(condition, message):
@@ -64,20 +127,51 @@ def load_config(path, namespace=None):
         "Invalid namespace",
     )
     require(
+        ns not in ("default", "openshift", "kube-system", "kube-public")
+        and not ns.startswith(("kube-", "openshift-")),
+        "Choose an application namespace, not a Kubernetes/OpenShift system namespace",
+    )
+    for key in ("agent_sandbox_namespace", "agent_sandbox_deployment"):
+        if key in config:
+            require(
+                isinstance(config[key], str) and DNS.fullmatch(config[key]),
+                f"Invalid {key}",
+            )
+    require(
         isinstance(config["context"], str) and config["context"].strip(),
         "context is required",
     )
     for name in ("gateway", "dashboard"):
         item = config[name]
-        fields(item, ("chart", "version", "host"), ("images",))
+        fields(item, ("chart", "version", "host"), ("images", "values_files"))
         require(
             isinstance(item["chart"], str) and item["chart"].startswith("oci://"),
             f"{name}.chart must be an OCI chart reference",
         )
         require(
             isinstance(item["version"], str) and VERSION.fullmatch(item["version"]),
-            f"{name}.version must pin a 0.1.x release (no latest or version ranges)",
+            f"{name}.version must be exact SemVer (no latest or version ranges)",
         )
+        require(
+            item["version"] != "0.0.0",
+            "Use a published release or pinned development version",
+        )
+        sources = item.get("values_files", [])
+        require(
+            isinstance(sources, list)
+            and all(isinstance(p, str) and p for p in sources),
+            f"{name}.values_files must be a list of file paths",
+        )
+        overrides = {}
+        for source in sources:
+            # SafeLoader does not construct Python objects. Do not include file
+            # contents in diagnostics: user-supplied files may contain secrets.
+            try:
+                overlay = yaml.safe_load((path.parent / source).read_text())
+            except yaml.YAMLError:
+                raise ValueError(f"Invalid YAML in {name} values file") from None
+            merge_values(overrides, overlay, EXTRA_VALUES[name])
+        item["values"] = overrides
         host = item["host"]
         require(
             isinstance(host, str)
@@ -122,6 +216,7 @@ def load_config(path, namespace=None):
             "allowed_roles",
             "client_secret_file",
             "ca_file",
+            "scope",
         ),
     )
     for key in (
@@ -167,6 +262,16 @@ def load_config(path, namespace=None):
         not oidc.get("allowed_roles") or oidc.get("provider") == "keycloak-oidc",
         "allowed_roles requires keycloak-oidc; use allowed_groups for generic OIDC",
     )
+    if "scope" in oidc:
+        require(
+            isinstance(oidc["scope"], str)
+            and re.fullmatch(
+                r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*",
+                oidc["scope"],
+            )
+            and "openid" in oidc["scope"].split(),
+            "oidc.scope must be space-separated OAuth scopes including openid",
+        )
     for key in ("client_secret_file", "ca_file"):
         if oidc.get(key):
             source = (path.parent / oidc[key]).resolve()
@@ -236,6 +341,7 @@ def chart_values(config):
             "allowedGroups": oidc.get("allowed_groups", []),
             "allowedRoles": oidc.get("allowed_roles", []),
             "caConfigMapName": ca,
+            "scope": oidc.get("scope", ""),
         },
         "openshiftRoute": {
             "enabled": True,
@@ -245,6 +351,7 @@ def chart_values(config):
         "networkPolicy": {"ingressNamespace": "openshift-ingress"},
     }
     for name, values in (("gateway", gateway), ("dashboard", dashboard)):
+        merge_values(values, config[name].get("values", {}), EXTRA_VALUES[name])
         for component, image in config[name].get("images", {}).items():
             values.setdefault(component, {})["image"] = image
     return gateway, dashboard
@@ -307,6 +414,13 @@ class Installer:
             )
             for release in releases:
                 name = release["name"]
+                # --keep-history leaves an uninstalled record, not a gateway.
+                # Keep fixed-name ownership checks: Helm still owns that history.
+                if release.get("status") == "uninstalled" and name not in (
+                    "openshell",
+                    "openshell-dashboard",
+                ):
+                    continue
                 gateway = release.get("chart", "").startswith("helm-chart-")
                 require(
                     not gateway or name == "openshell",
@@ -319,6 +433,160 @@ class Installer:
             if len(releases) < 256:
                 break
             offset += len(releases)
+
+    def cluster_checks(self, namespace):
+        version = self.get("clusterversion.config.openshift.io", "version", False)
+        print(
+            f"OpenShift: {(version or {}).get('status', {}).get('desired', {}).get('version', 'unknown')}"
+        )
+        storage = json.loads(
+            self.run([*self.kube, "get", "storageclasses", "-o", "json"])
+        )
+        defaults = [
+            item["metadata"]["name"]
+            for item in storage["items"]
+            if any(
+                item["metadata"].get("annotations", {}).get(key) == "true"
+                for key in (
+                    "storageclass.kubernetes.io/is-default-class",
+                    "storageclass.beta.kubernetes.io/is-default-class",
+                )
+            )
+        ]
+        require(
+            defaults,
+            "No default StorageClass; the gateway chart's SQLite PVC requires one",
+        )
+        print(
+            f"Default storage: {', '.join(defaults)} (verify block-backed SQLite storage)"
+        )
+        custom = (
+            self.config["gateway"]
+            .get("values", {})
+            .get("server", {})
+            .get("workspaceStorageClass")
+        )
+        if custom:
+            require(
+                any(item["metadata"]["name"] == custom for item in storage["items"]),
+                "Configured workspaceStorageClass does not exist",
+            )
+        nodes = json.loads(self.run([*self.kube, "get", "nodes", "-o", "json"]))
+        kernels = sorted(
+            {
+                item.get("status", {})
+                .get("nodeInfo", {})
+                .get("kernelVersion", "unknown")
+                for item in nodes["items"]
+            }
+        )
+        print(f"Node kernels: {', '.join(kernels) or 'none reported'}")
+        if any(
+            (match := re.match(r"(\d+)\.(\d+)", kernel))
+            and tuple(map(int, match.groups())) < (5, 19)
+            for kernel in kernels
+        ):
+            print(
+                "Note: kernels before 5.19 need an OpenShell build with the legacy-kernel fixes; verify sandbox networking."
+            )
+        # Check actual installation operations instead of requiring wildcard
+        # cluster-admin. These checks cannot prove RBAC bind/escalate or SCC admission.
+        scoped = [
+            "secrets",
+            "configmaps",
+            "services",
+            "serviceaccounts",
+            "deployments.apps",
+            "statefulsets.apps",
+            "jobs.batch",
+            "roles.rbac.authorization.k8s.io",
+            "rolebindings.rbac.authorization.k8s.io",
+            "routes.route.openshift.io",
+            "networkpolicies.networking.k8s.io",
+        ]
+        operations = [
+            (verb, resource, True)
+            for resource in scoped
+            for verb in ("create", "patch")
+        ]
+        operations += [
+            (verb, resource, False)
+            for resource in (
+                "clusterroles.rbac.authorization.k8s.io",
+                "clusterrolebindings.rbac.authorization.k8s.io",
+            )
+            for verb in ("create", "patch")
+        ]
+        if not namespace:
+            operations.append(("create", "namespaces", False))
+        for verb, resource, namespaced in operations:
+            try:
+                answer = self.run(
+                    [
+                        *self.kube,
+                        "auth",
+                        "can-i",
+                        verb,
+                        resource,
+                        *(["-n", self.ns] if namespaced else []),
+                    ]
+                )
+                require(answer.strip() == "yes", "denied")
+            except (RuntimeError, ValueError):
+                raise ValueError(
+                    f"Preflight permission check failed: {verb} {resource}"
+                    + (f" in {self.ns}" if namespaced else " cluster-wide")
+                ) from None
+
+    def identity_state(self):
+        return {
+            "gateway-host": self.config["gateway"]["host"],
+            **{
+                f"oidc-{key.replace('_', '-')}": self.config["oidc"][key]
+                for key in ("issuer", "audience", "client_id")
+            },
+        }
+
+    def check_identity(self, state):
+        desired = self.identity_state()
+        for key, value in (state or {}).get("data", {}).items():
+            if key in desired:
+                require(
+                    value == desired[key],
+                    f"Installer identity {key} changed; explicit identity/certificate migration is required",
+                )
+        states = json.loads(
+            self.run(
+                [
+                    *self.kube,
+                    "get",
+                    "configmaps",
+                    "--all-namespaces",
+                    "-l",
+                    f"{OWNER}={OWNER_VALUE}",
+                    "-o",
+                    "json",
+                ]
+            )
+        )
+        for other in states["items"]:
+            if (
+                other["metadata"]["name"] != INSTALL_STATE
+                or other["metadata"].get("namespace") == self.ns
+            ):
+                continue
+            data = other.get("data", {})
+            if "oidc-issuer" not in data:
+                print(
+                    f"Note: legacy installer state in {other['metadata']['namespace']} has no identity metadata; verify audience isolation manually."
+                )
+                continue
+            if data["oidc-issuer"].rstrip("/") == desired["oidc-issuer"].rstrip("/"):
+                require(
+                    data.get("oidc-audience") != desired["oidc-audience"]
+                    and data.get("oidc-client-id") != desired["oidc-client-id"],
+                    f"OIDC audience/browser client already used by namespace {other['metadata']['namespace']}; provision distinct per-gateway registrations",
+                )
 
     def preflight(self):
         self.run([*self.kube, "get", "--raw", "/apis/route.openshift.io/v1"])
@@ -351,6 +619,7 @@ class Installer:
             not namespace or namespace.get("status", {}).get("phase") != "Terminating",
             "Namespace is terminating",
         )
+        self.cluster_checks(namespace)
         state = self.get("configmap", INSTALL_STATE) if namespace else None
         require(
             not state or state["metadata"].get("labels", {}).get(OWNER) == OWNER_VALUE,
@@ -372,6 +641,7 @@ class Installer:
             or original_host == self.config["gateway"]["host"],
             "Gateway hostname differs from the original install; certificate migration is required",
         )
+        self.check_identity(state)
         if namespace:
             self.check_releases(managed=bool(state or legacy_host))
             # The chart's bootstrap hook reuses existing TLS material. Do not
@@ -391,9 +661,10 @@ class Installer:
             existing or self.config["oidc"].get("client_secret_file"),
             "oidc.client_secret_file is required for the first install",
         )
+        self.credentials(check_only=True)
         return namespace
 
-    def credentials(self):
+    def credentials(self, check_only=False):
         oidc = self.config["oidc"]
         existing = self.get("secret", OIDC_SECRET)
         supplied = (
@@ -415,20 +686,21 @@ class Installer:
             )
         else:
             require(supplied, "Client secret file is required")
-            self.create(
-                {
-                    "apiVersion": "v1",
-                    "kind": "Secret",
-                    "type": "Opaque",
-                    "metadata": {"name": OIDC_SECRET, "namespace": self.ns},
-                    "data": {
-                        "client-secret": base64.b64encode(supplied).decode(),
-                        "cookie-secret": base64.b64encode(
-                            secrets.token_urlsafe(32).encode()
-                        ).decode(),
-                    },
-                }
-            )
+            if not check_only:
+                self.create(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "type": "Opaque",
+                        "metadata": {"name": OIDC_SECRET, "namespace": self.ns},
+                        "data": {
+                            "client-secret": base64.b64encode(supplied).decode(),
+                            "cookie-secret": base64.b64encode(
+                                secrets.token_urlsafe(32).encode()
+                            ).decode(),
+                        },
+                    }
+                )
         if oidc.get("ca_file"):
             ca = Path(oidc["ca_file"]).read_text()
             existing_ca = self.get("configmap", OIDC_CA)
@@ -436,7 +708,7 @@ class Installer:
                 not existing_ca or existing_ca.get("data", {}).get("ca.crt") == ca,
                 "OIDC CA differs; rotate the ConfigMap and restart both releases explicitly",
             )
-            if not existing_ca:
+            if not existing_ca and not check_only:
                 self.create(
                     {
                         "apiVersion": "v1",
@@ -489,8 +761,23 @@ class Installer:
                         "namespace": self.ns,
                         "labels": {OWNER: OWNER_VALUE},
                     },
-                    "data": {"gateway-host": self.config["gateway"]["host"]},
+                    "data": self.identity_state(),
                 }
+            )
+        else:
+            # Add identity metadata to legacy state only after preflight passed.
+            self.run(
+                [
+                    *self.kube,
+                    "-n",
+                    self.ns,
+                    "patch",
+                    "configmap",
+                    INSTALL_STATE,
+                    "--type=merge",
+                    "-p",
+                    json.dumps({"data": self.identity_state()}),
+                ]
             )
         self.credentials()
         for index, release in enumerate(("openshell", "openshell-dashboard")):
@@ -541,10 +828,16 @@ def main():
         "--namespace",
         help="Administrator-selected namespace; overrides config.namespace (created if missing)",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check",
         action="store_true",
         help="Validate and render charts without accessing the cluster",
+    )
+    mode.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Render charts and check cluster prerequisites without installing",
     )
     parser.add_argument(
         "--gateway-chart-directory",
@@ -634,7 +927,10 @@ def main():
             "Both charts rendered successfully. This does not verify cluster or API compatibility.",
             flush=True,
         )
-        if not args.check:
+        if args.preflight:
+            installer.preflight()
+            print("Cluster preflight passed; no installation resources were changed.")
+        elif not args.check:
             installer.install(charts, files)
 
 

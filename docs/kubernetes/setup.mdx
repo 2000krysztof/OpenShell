@@ -99,6 +99,10 @@ The installer includes a render-only check, preserves resources on failure, and
 requires explicit chart versions. Validate login, workspace authorization,
 sandbox lifecycle, and terminal access on your target cluster before sharing the
 deployment; chart rendering does not establish RHOAI qualification.
+The installer accepts operational Helm values files and custom OIDC scopes, and
+provides a read-only cluster preflight and token-based authorization verifier.
+Provision distinct OIDC audiences and browser clients for separate gateways;
+namespace separation alone does not establish identity isolation.
 
 <Steps>
 
