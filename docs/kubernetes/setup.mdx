@@ -88,6 +88,15 @@ OpenShell detects the served Agent Sandbox `Sandbox` API when the Kubernetes gat
 
 ## Install OpenShell
 
+For an administrator-managed OpenShift deployment with a browser UI, the ODH
+fork provides a [gateway and dashboard installer](https://github.com/opendatahub-io/openshell/tree/main/deploy/rhoai).
+It creates a dedicated namespace and installs separately versioned gateway and
+dashboard charts using customer OIDC. Agent Sandbox remains a prerequisite.
+The installer includes a render-only check, preserves resources on failure, and
+requires explicit chart versions. Validate login, workspace authorization,
+sandbox lifecycle, and terminal access on your target cluster before sharing the
+deployment; chart rendering does not establish RHOAI qualification.
+
 <Steps>
 
 ## Create the namespace
