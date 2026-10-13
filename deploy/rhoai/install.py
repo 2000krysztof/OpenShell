@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 OWNER = "openshell.ai/installer"
 OWNER_VALUE = "odh-dashboard"
 GATEWAY_HOST = "openshell.ai/installer-gateway-host"
+INSTALL_STATE = "openshell-installer"
 OIDC_SECRET = "openshell-dashboard-oidc"
 OIDC_CA = "openshell-oidc-ca"
 VERSION = re.compile(r"0\.1\.[0-9]+(?:-[0-9A-Za-z.-]+)?")
@@ -45,8 +46,11 @@ def fields(obj, required, optional=()):
         require(key in obj and obj[key] != "", f"Missing configuration field: {key}")
 
 
-def load_config(path):
+def load_config(path, namespace=None):
     config = json.loads(path.read_text())
+    if namespace is not None:
+        require(isinstance(config, dict), "Configuration must be a JSON object")
+        config["namespace"] = namespace
     fields(
         config,
         ("namespace", "context", "gateway", "dashboard", "oidc"),
@@ -272,6 +276,50 @@ class Installer:
     def create(self, resource):
         self.run([*self.kube, "create", "-f", "-"], json.dumps(resource))
 
+    def check_releases(self, managed):
+        # Explicit status flags work with both Helm 3 and Helm 4. Paginate so a
+        # busy administrator-managed namespace cannot hide a conflicting release.
+        offset = 0
+        while True:
+            releases = json.loads(
+                self.run(
+                    [
+                        "helm",
+                        "list",
+                        "--kube-context",
+                        self.config["context"],
+                        "--namespace",
+                        self.ns,
+                        "--output",
+                        "json",
+                        "--max",
+                        "256",
+                        "--offset",
+                        str(offset),
+                        "--deployed",
+                        "--failed",
+                        "--pending",
+                        "--uninstalling",
+                        "--uninstalled",
+                        "--superseded",
+                    ]
+                )
+            )
+            for release in releases:
+                name = release["name"]
+                gateway = release.get("chart", "").startswith("helm-chart-")
+                require(
+                    not gateway or name == "openshell",
+                    f"Namespace {self.ns} already has gateway release {name}; use one gateway per namespace",
+                )
+                require(
+                    managed or name not in ("openshell", "openshell-dashboard"),
+                    f"Release {name} already exists outside this installer; migrate it explicitly",
+                )
+            if len(releases) < 256:
+                break
+            offset += len(releases)
+
     def preflight(self):
         self.run([*self.kube, "get", "--raw", "/apis/route.openshift.io/v1"])
         crd = self.get("crd", "sandboxes.agents.x-k8s.io", False)
@@ -300,20 +348,44 @@ class Installer:
         )
         namespace = self.get("namespace", self.ns, False)
         require(
-            not namespace
-            or namespace["metadata"].get("labels", {}).get(OWNER) == OWNER_VALUE,
-            "Namespace already exists and is not owned by this installer; choose a new namespace",
-        )
-        require(
             not namespace or namespace.get("status", {}).get("phase") != "Terminating",
             "Namespace is terminating",
         )
+        state = self.get("configmap", INSTALL_STATE) if namespace else None
         require(
-            not namespace
-            or namespace["metadata"].get("annotations", {}).get(GATEWAY_HOST)
-            == self.config["gateway"]["host"],
+            not state or state["metadata"].get("labels", {}).get(OWNER) == OWNER_VALUE,
+            f"ConfigMap {INSTALL_STATE} already exists outside this installer",
+        )
+        # Preserve compatibility with installations made before state moved off
+        # the Namespace. Never modify administrator-owned Namespace metadata.
+        legacy_host = (
+            (namespace or {})
+            .get("metadata", {})
+            .get("annotations", {})
+            .get(GATEWAY_HOST)
+        )
+        original_host = (
+            state.get("data", {}).get("gateway-host") if state else legacy_host
+        )
+        require(
+            not (state or legacy_host)
+            or original_host == self.config["gateway"]["host"],
             "Gateway hostname differs from the original install; certificate migration is required",
         )
+        if namespace:
+            self.check_releases(managed=bool(state or legacy_host))
+            # The chart's bootstrap hook reuses existing TLS material. Do not
+            # accidentally use certificates belonging to another gateway.
+            if not (state or legacy_host):
+                for secret in (
+                    "openshell-server-tls",
+                    "openshell-client-tls",
+                    "openshell-jwt-keys",
+                ):
+                    require(
+                        not self.get("secret", secret),
+                        f"Existing gateway Secret {secret} requires explicit migration",
+                    )
         existing = self.get("secret", OIDC_SECRET) if namespace else None
         require(
             existing or self.config["oidc"].get("client_secret_file"),
@@ -404,8 +476,20 @@ class Installer:
                     "metadata": {
                         "name": self.ns,
                         "labels": {OWNER: OWNER_VALUE},
-                        "annotations": {GATEWAY_HOST: self.config["gateway"]["host"]},
                     },
+                }
+            )
+        if not self.get("configmap", INSTALL_STATE):
+            self.create(
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": INSTALL_STATE,
+                        "namespace": self.ns,
+                        "labels": {OWNER: OWNER_VALUE},
+                    },
+                    "data": {"gateway-host": self.config["gateway"]["host"]},
                 }
             )
         self.credentials()
@@ -454,6 +538,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
+        "--namespace",
+        help="Administrator-selected namespace; overrides config.namespace (created if missing)",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Validate and render charts without accessing the cluster",
@@ -483,7 +571,7 @@ def main():
     )
     for tool in ["helm"] if args.check else ["helm", "kubectl"]:
         require(shutil.which(tool), f"Required tool not found: {tool}")
-    config = load_config(args.config.resolve())
+    config = load_config(args.config.resolve(), args.namespace)
     installer = Installer(config, args.timeout)
     os.umask(0o077)
     with tempfile.TemporaryDirectory(prefix="openshell-install-") as temporary:

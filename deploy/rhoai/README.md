@@ -1,7 +1,9 @@
 # OpenShell and Dashboard installer for OpenShift
 
-This ODH-fork installer creates a dedicated namespace and installs two independent
-Helm releases: `openshell` and `openshell-dashboard`. The gateway chart supplies
+This ODH-fork installer installs two independent Helm releases, `openshell` and
+`openshell-dashboard`, into the administrator-selected namespace. It reuses an
+existing namespace or creates it if missing. Each namespace has one gateway and
+its dashboard; reruns upgrade the same releases. The gateway chart supplies
 the gateway and the configuration for launching supervisor and sandbox workloads.
 The UI chart remains in the [dashboard repository](https://github.com/opendatahub-io/openshell-dashboard/tree/main/deploy/helm/openshell-dashboard).
 
@@ -21,6 +23,9 @@ OIDC; existing customer realms were not changed.
 The following checks passed with gateway chart `0.1.3` and dashboard chart `0.1.0`:
 
 - First installation into a new namespace and a second run with the same inputs.
+- Installation and rerun in a separately pre-created namespace selected with
+  `--namespace`, with both releases reaching revision 2 and the namespace's labels,
+  annotations, and OpenShift SCC allocations preserved.
 - Gateway readiness, both dashboard containers ready, and persistent storage bound.
 - Public HTTPS routing and HTTP 401 for unauthenticated dashboard API requests.
 - Browser OIDC redirect/login/callback flow and authenticated workspace and gateway API calls.
@@ -43,8 +48,9 @@ configuration and credentials are kept outside the repository.
 ## Prerequisites
 
 - `uv`, Helm 3.17.3 or later, and `kubectl` on the administrator's workstation.
-- An OpenShift cluster, an explicit kubeconfig context, and permission to create
-  namespaces and the namespaced/cluster RBAC required by the gateway chart.
+- An OpenShift cluster, an explicit kubeconfig context, and permission to manage
+  the namespaced/cluster resources required by the charts. Permission to create
+  namespaces is needed only when the selected namespace does not exist.
 - Agent Sandbox CRDs and a running controller installed by the cluster
   administrator. The installer checks the supported served Sandbox API and waits
   for the controller Deployment. Override `agent_sandbox_namespace` and
@@ -107,13 +113,30 @@ uv run --script --python 3.12 deploy/rhoai/install.py \
   --config "$HOME/.config/openshell-rhoai/config.json"
 ```
 
+Set `namespace` in the JSON to your team/project namespace, or override it on the
+command line (the override also works with `--check`):
+
+```shell
+uv run --script --python 3.12 deploy/rhoai/install.py \
+  --config "$HOME/.config/openshell-rhoai/config.json" --namespace research-team
+```
+
+`--namespace` takes precedence; you may omit the JSON `namespace` when passing
+this option. Both charts, Secrets, and sandbox resources target this namespace.
+Gateway Service DNS and certificate SANs are derived from the selected name.
+Existing namespace labels, annotations, and OpenShift SCC allocations are
+preserved. Use a separate configuration with distinct public hostnames for each
+gateway namespace, and register each dashboard callback with the IdP. Specifying
+a different namespace creates another deployment; it does not move an existing one.
+
 `--check` still downloads the pinned charts. It discards rendered manifests and
 does not validate connectivity, SCC admission, token claims, or runtime behavior.
 It reads the client secret file's existence/size, not its contents. Temporary
 values files have owner-only permissions and contain no client or cookie secrets.
 
-The installer creates a labeled namespace, a client/cookie Secret, and an optional
-OIDC CA ConfigMap. It installs the gateway first, checks the gateway CA Secret,
+The installer creates the namespace only when missing, then creates an installer
+state ConfigMap, a client/cookie Secret, and an optional OIDC CA ConfigMap.
+It installs the gateway first, checks the gateway CA Secret,
 and installs the dashboard with that CA and the internal gateway Service URL.
 Both releases use OpenShift-assigned UID/GID settings. It waits for Helm readiness
 and checks Route admission. Set `--timeout 15m` for a slower cluster.
@@ -142,13 +165,19 @@ Readiness and Route admission alone do not prove this flow works.
 
 ## Reruns, upgrades, and failures
 
-Rerun the same command after correcting a failure. An existing namespace is
-accepted only if it has this installer's ownership label. Unrelated namespaces
-are rejected, and existing namespace SCC allocation annotations are never copied.
-Do not manually label an unrelated namespace to bypass this check.
-The original gateway hostname is recorded on the namespace. Changing it is
+Rerun the same command after correcting a failure. The administrator selects the
+namespace; it does not need an installer ownership label. The fixed release names
+provide one gateway/dashboard pair per namespace. An existing gateway chart under
+a different release name, or either fixed release without installer state, is
+rejected and needs explicit migration. Unmanaged gateway TLS/JWT Secrets are also
+rejected so the bootstrap hook cannot silently reuse another gateway's identity.
+Unrelated Helm releases in the selected namespace are left alone.
+
+The original gateway hostname is recorded in the `openshell-installer` ConfigMap.
+Earlier installations recorded it on the namespace; reruns migrate that state
+without changing namespace metadata. Changing the recorded hostname is
 rejected because the certificate hook preserves existing certificates; migrate
-the certificate and endpoint explicitly rather than changing this annotation.
+the certificate and endpoint explicitly rather than editing installer state.
 
 The installer preserves existing client and cookie secrets. You may omit
 `client_secret_file` after the first installation. A provided secret or private

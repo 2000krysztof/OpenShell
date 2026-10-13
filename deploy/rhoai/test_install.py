@@ -36,11 +36,15 @@ class FakeCluster(installer.Installer):
             }
         }
         self.calls = []
+        self.releases = []
         self.fail_dashboard = False
 
     def run(self, args, payload=None):
         self.calls.append((args, payload))
-        if args[0] == "helm":
+        if args[:2] == ["helm", "list"]:
+            offset = int(args[args.index("--offset") + 1])
+            return json.dumps(self.releases[offset : offset + 256])
+        if args[:2] == ["helm", "upgrade"]:
             if self.fail_dashboard and "openshell-dashboard" in args:
                 raise RuntimeError("dashboard failed")
             self.objects[("secret", "openshell-client-tls")] = {
@@ -53,6 +57,15 @@ class FakeCluster(installer.Installer):
                     ]
                 }
             }
+            if not any(r["name"] == args[3] for r in self.releases):
+                self.releases.append(
+                    {
+                        "name": args[3],
+                        "chart": "helm-chart-0.1.3"
+                        if args[3] == "openshell"
+                        else "openshell-dashboard-0.1.0",
+                    }
+                )
         elif "get" in args and "--raw" not in args:
             start = args.index("get")
             obj = self.objects.get(tuple(args[start + 1 : start + 3]))
@@ -128,13 +141,122 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(gateway["server"]["tls"]["enableMtls"])
         self.assertIsNone(gateway["securityContext"]["runAsUser"])
 
-    def test_refuses_foreign_namespace_before_mutation(self):
+    def test_existing_admin_namespace_preserves_metadata_and_targets_releases(self):
+        self.config["namespace"] = "research-team"
         cluster = self.cluster()
-        cluster.objects[("namespace", cluster.ns)] = {"metadata": {"labels": {}}}
-        with self.assertRaisesRegex(ValueError, "not owned"):
-            cluster.install(["gateway.tgz", "dashboard.tgz"], ["g.json", "d.json"])
-        self.assertFalse(
-            any("create" in args or args[0] == "helm" for args, _ in cluster.calls)
+        namespace = {
+            "metadata": {
+                "name": cluster.ns,
+                "labels": {"team": "research"},
+                "annotations": {"openshift.io/sa.scc.uid-range": "1000100000/10000"},
+            },
+            "status": {"phase": "Active"},
+        }
+        cluster.objects[("namespace", cluster.ns)] = copy.deepcopy(namespace)
+        cluster.install(["gateway.tgz", "dashboard.tgz"], ["g.json", "d.json"])
+        cluster.install(["gateway.tgz", "dashboard.tgz"], ["g.json", "d.json"])
+        self.assertEqual(cluster.objects[("namespace", cluster.ns)], namespace)
+        self.assertEqual(
+            {r["name"] for r in cluster.releases}, {"openshell", "openshell-dashboard"}
+        )
+        for args, payload in cluster.calls:
+            if args[:2] == ["helm", "upgrade"]:
+                self.assertEqual(args[args.index("--namespace") + 1], "research-team")
+            if "create" in args:
+                resource = json.loads(payload)
+                self.assertNotEqual(resource["kind"], "Namespace")
+                self.assertEqual(resource["metadata"]["namespace"], "research-team")
+        gateway, dashboard = installer.chart_values(cluster.config)
+        self.assertEqual(gateway["server"]["sandboxNamespace"], "research-team")
+        self.assertIn(
+            "openshell.research-team.svc", gateway["pkiInitJob"]["serverDnsNames"]
+        )
+        self.assertEqual(
+            dashboard["gateway"]["url"],
+            "grpcs://openshell.research-team.svc.cluster.local:8080",
+        )
+
+    def test_namespace_override_validated_and_config_namespace_optional_with_override(
+        self,
+    ):
+        self.config.pop("namespace")
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+        self.assertEqual(
+            installer.load_config(path, "admin-project")["namespace"], "admin-project"
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid namespace"):
+            installer.load_config(path, "invalid/namespace")
+        with self.assertRaisesRegex(ValueError, "namespace"):
+            installer.load_config(path)
+
+    def test_existing_gateway_or_foreign_release_rejected_before_mutation(self):
+        for release in (
+            {"name": "another-gateway", "chart": "helm-chart-0.1.3"},
+            {"name": "openshell", "chart": "helm-chart-0.1.3"},
+            {"name": "openshell-dashboard", "chart": "other-chart-1.0.0"},
+        ):
+            with self.subTest(release=release):
+                cluster = self.cluster()
+                cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+                cluster.releases = [release]
+                with self.assertRaises(ValueError):
+                    cluster.install([], [])
+                self.assertFalse(
+                    any(
+                        "create" in args or args[:2] == ["helm", "upgrade"]
+                        for args, _ in cluster.calls
+                    )
+                )
+
+    def test_conflict_on_later_release_page_is_detected(self):
+        cluster = self.cluster()
+        cluster.releases = [
+            {"name": f"other-{i}", "chart": "unrelated-1.0.0"} for i in range(256)
+        ]
+        cluster.releases.append(
+            {"name": "another-gateway", "chart": "helm-chart-0.1.3"}
+        )
+        with self.assertRaisesRegex(ValueError, "one gateway"):
+            cluster.check_releases(managed=True)
+
+    def test_terminating_namespace_is_rejected(self):
+        cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {
+            "metadata": {},
+            "status": {"phase": "Terminating"},
+        }
+        with self.assertRaisesRegex(ValueError, "terminating"):
+            cluster.install([], [])
+
+    def test_preexisting_gateway_certificate_is_not_reused(self):
+        cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+        cluster.objects[("secret", "openshell-server-tls")] = {
+            "data": {"tls.crt": "old"}
+        }
+        with self.assertRaisesRegex(ValueError, "explicit migration"):
+            cluster.install([], [])
+
+    def test_legacy_install_migrates_without_modifying_namespace(self):
+        cluster = self.cluster()
+        namespace = {
+            "metadata": {
+                "labels": {installer.OWNER: installer.OWNER_VALUE},
+                "annotations": {
+                    installer.GATEWAY_HOST: cluster.config["gateway"]["host"]
+                },
+            }
+        }
+        cluster.objects[("namespace", cluster.ns)] = copy.deepcopy(namespace)
+        cluster.releases = [{"name": "openshell", "chart": "helm-chart-0.1.3"}]
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertEqual(cluster.objects[("namespace", cluster.ns)], namespace)
+        self.assertEqual(
+            cluster.objects[("configmap", installer.INSTALL_STATE)]["data"][
+                "gateway-host"
+            ],
+            cluster.config["gateway"]["host"],
         )
 
     def test_missing_prerequisite_stops_before_mutation(self):
@@ -274,6 +396,8 @@ class InstallTests(unittest.TestCase):
             "--config",
             str(path),
             "--check",
+            "--namespace",
+            "render-project",
             "--gateway-chart-directory",
             str(self.root / "gateway"),
             "--dashboard-chart-directory",
@@ -288,6 +412,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         for call in run.call_args_list:
             self.assertEqual(call.args[0][:2], ["helm", "template"])
+            args = call.args[0]
+            self.assertEqual(args[args.index("--namespace") + 1], "render-project")
 
 
 if __name__ == "__main__":

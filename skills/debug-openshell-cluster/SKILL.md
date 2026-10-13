@@ -93,12 +93,17 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 ### Step 3: Check Gateway Startup Dependencies
 
 For an ODH gateway-and-dashboard installation, inspect both Helm releases
-(`openshell` and `openshell-dashboard`) in the same namespace. The installer
+(`openshell` and `openshell-dashboard`) in the administrator-selected namespace
+(`namespace` in the configuration or the `--namespace` override). Existing
+namespaces do not need an installer ownership label. The installer
 preserves partial installations and credentials on failure; gateway readiness
-does not establish dashboard login or sandbox readiness. Check namespace label
-`openshell.ai/installer=odh-dashboard`, the dashboard OIDC Secret, the shared
-gateway CA Secret, and admission of both Routes. Do not add the ownership label
-to an unrelated namespace to bypass installation checks. Use the published
+does not establish dashboard login or sandbox readiness. Check the
+`openshell-installer` state ConfigMap, the dashboard OIDC Secret, the shared
+gateway CA Secret, and admission of both Routes. A gateway chart under another
+release name or an existing fixed release without installer state requires
+explicit migration; do not change state to bypass these checks. Earlier
+installations used namespace annotations for state, which reruns migrate while
+preserving namespace metadata. Use the published
 [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md)
 for the installation entry point. Diagnose Agent Sandbox availability separately;
 the installer does not provision that controller or RHOAI itself.
