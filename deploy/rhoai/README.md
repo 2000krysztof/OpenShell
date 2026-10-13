@@ -35,12 +35,6 @@ The following checks passed with gateway chart `0.1.3` and dashboard chart `0.1.
 - Sandbox creation through the dashboard API, workload/supervisor readiness,
   authenticated terminal WebSocket execution with exit code 0, and completed deletion.
 
-An expired, unrelated Kagenti admission webhook initially blocked pod creation.
-Removing Kagenti restored both Agent Sandbox and the existing Keycloak instance.
-The installer correctly stopped before installing OpenShell while Agent Sandbox
-was missing or unhealthy. Diagnose admission webhook failures before changing
-OpenShell SCC settings or authentication configuration.
-
 These checks do not establish FIPS qualification, production certificate renewal,
 standard-user cross-workspace isolation, or a full UI interaction test. The live
 configuration and credentials are kept outside the repository.
