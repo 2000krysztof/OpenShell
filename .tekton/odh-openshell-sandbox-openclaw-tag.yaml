@@ -10,7 +10,7 @@ metadata:
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: |
       event == "push"
-      && target_branch.matches("^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+-rhaiv\\.[0-9]+$")
+      && target_branch.matches("^refs/tags/[0-9]+\\.[0-9]+\\.[0-9]+$")
   creationTimestamp: null
   labels:
     appstudio.openshift.io/application: opendatahub-builds
@@ -42,6 +42,9 @@ spec:
         {"type": "npm", "path": "deploy/konflux/openclaw"},
         {"type": "rpm", "path": "deploy/konflux/openclaw"}
       ]
+  - name: build-args
+    value:
+    - "OPENCLAW_VERSION={{git_tag}}"
   pipelineRef:
     resolver: git
     params:
