@@ -383,6 +383,42 @@ class Installer:
     def create(self, resource):
         self.run([*self.kube, "create", "-f", "-"], json.dumps(resource))
 
+    def release_has_gateway(self, release):
+        # Chart names and images can change in downstream packages. Inspect the
+        # stored workload instead, including failed releases with no running pod.
+        manifest = self.run(
+            [
+                "helm",
+                "get",
+                "manifest",
+                release,
+                "--kube-context",
+                self.config["context"],
+                "--namespace",
+                self.ns,
+            ]
+        )
+        try:
+            for resource in yaml.safe_load_all(manifest):
+                if not isinstance(resource, dict):
+                    continue
+                if resource.get("kind") == "Pod":
+                    pod = resource
+                elif resource.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+                    pod = resource.get("spec", {}).get("template", {})
+                else:
+                    continue
+                for container in pod.get("spec", {}).get("containers", []):
+                    if container.get("name") == "openshell-gateway" or any(
+                        Path(arg).name == "openshell-gateway"
+                        for arg in container.get("command", [])
+                    ):
+                        return True
+        except yaml.YAMLError:
+            # Helm manifests can contain Secrets; never include parser excerpts.
+            raise ValueError(f"Cannot inspect manifest for release {release}") from None
+        return False
+
     def check_releases(self, managed):
         # Explicit status flags work with both Helm 3 and Helm 4. Paginate so a
         # busy administrator-managed namespace cannot hide a conflicting release.
@@ -421,15 +457,18 @@ class Installer:
                     "openshell-dashboard",
                 ):
                     continue
-                gateway = release.get("chart", "").startswith("helm-chart-")
-                require(
-                    not gateway or name == "openshell",
-                    f"Namespace {self.ns} already has gateway release {name}; use one gateway per namespace",
-                )
                 require(
                     managed or name not in ("openshell", "openshell-dashboard"),
                     f"Release {name} already exists outside this installer; migrate it explicitly",
                 )
+                if name != "openshell":
+                    gateway = release.get("chart", "").startswith(
+                        "helm-chart-"
+                    ) or self.release_has_gateway(name)
+                    require(
+                        not gateway,
+                        f"Namespace {self.ns} already has gateway release {name}; use one gateway per namespace",
+                    )
             if len(releases) < 256:
                 break
             offset += len(releases)
@@ -656,17 +695,19 @@ class Installer:
                         not self.get("secret", secret),
                         f"Existing gateway Secret {secret} requires explicit migration",
                     )
-        existing = self.get("secret", OIDC_SECRET) if namespace else None
         require(
-            existing or self.config["oidc"].get("client_secret_file"),
+            state or legacy_host or self.config["oidc"].get("client_secret_file"),
             "oidc.client_secret_file is required for the first install",
         )
-        self.credentials(check_only=True)
+        self.credentials(check_only=True, namespace_exists=bool(namespace))
         return namespace
 
-    def credentials(self, check_only=False):
+    def credentials(self, check_only=False, *, namespace_exists=True):
+        require(
+            namespace_exists or check_only, "Create the namespace before credentials"
+        )
         oidc = self.config["oidc"]
-        existing = self.get("secret", OIDC_SECRET)
+        existing = self.get("secret", OIDC_SECRET) if namespace_exists else None
         supplied = (
             Path(oidc["client_secret_file"]).read_bytes().rstrip(b"\r\n")
             if oidc.get("client_secret_file")
@@ -703,7 +744,7 @@ class Installer:
                 )
         if oidc.get("ca_file"):
             ca = Path(oidc["ca_file"]).read_text()
-            existing_ca = self.get("configmap", OIDC_CA)
+            existing_ca = self.get("configmap", OIDC_CA) if namespace_exists else None
             require(
                 not existing_ca or existing_ca.get("data", {}).get("ca.crt") == ca,
                 "OIDC CA differs; rotate the ConfigMap and restart both releases explicitly",

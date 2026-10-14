@@ -41,6 +41,7 @@ class FakeCluster(installer.Installer):
         }
         self.calls = []
         self.releases = []
+        self.manifests = {}
         self.fail_dashboard = False
         self.storage = [
             {
@@ -57,6 +58,13 @@ class FakeCluster(installer.Installer):
 
     def run(self, args, payload=None):
         self.calls.append((args, payload))
+        if (
+            args[0] == "kubectl"
+            and "-n" in args
+            and "get" in args
+            and ("namespace", args[args.index("-n") + 1]) not in self.objects
+        ):
+            raise RuntimeError("namespace not found")
         if "can-i" in args:
             return (
                 "no"
@@ -77,6 +85,8 @@ class FakeCluster(installer.Installer):
         if args[:2] == ["helm", "list"]:
             offset = int(args[args.index("--offset") + 1])
             return json.dumps(self.releases[offset : offset + 256])
+        if args[:3] == ["helm", "get", "manifest"]:
+            return self.manifests.get(args[3], "")
         if args[:2] == ["helm", "upgrade"]:
             if self.fail_dashboard and "openshell-dashboard" in args:
                 raise RuntimeError("dashboard failed")
@@ -266,7 +276,11 @@ class InstallTests(unittest.TestCase):
                 "status": "uninstalled",
             }
         ]
+        cluster.manifests["retired-gateway"] = self.gateway_manifest()
         cluster.preflight()
+        self.assertFalse(
+            any(args[:3] == ["helm", "get", "manifest"] for args, _ in cluster.calls)
+        )
         cluster.objects[("secret", "openshell-server-tls")] = {"data": {}}
         with self.assertRaisesRegex(ValueError, "explicit migration"):
             cluster.preflight()
@@ -409,6 +423,74 @@ class InstallTests(unittest.TestCase):
                     )
                 )
 
+    @staticmethod
+    def gateway_manifest(kind="StatefulSet", container=None):
+        return json.dumps(
+            {
+                "apiVersion": "apps/v1",
+                "kind": kind,
+                "metadata": {"name": "renamed-gateway"},
+                "spec": {
+                    "replicas": 0,
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                container
+                                or {
+                                    "name": "openshell-gateway",
+                                    "image": "registry.example/custom/runtime:1.0",
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+
+    def test_repackaged_gateway_rejected_before_mutation(self):
+        for kind, status in (("StatefulSet", "deployed"), ("Deployment", "failed")):
+            with self.subTest(kind=kind, status=status):
+                cluster = self.cluster()
+                cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+                cluster.releases = [
+                    {"name": "team-gateway", "chart": "custom-1.0.0", "status": status}
+                ]
+                cluster.manifests["team-gateway"] = self.gateway_manifest(kind)
+                before = copy.deepcopy(cluster.objects)
+                with self.assertRaisesRegex(ValueError, "one gateway per namespace"):
+                    cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+                self.assertEqual(cluster.objects, before)
+                self.assertFalse(
+                    any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
+                )
+
+    def test_gateway_executable_detected_with_renamed_container(self):
+        cluster = self.cluster()
+        cluster.manifests["custom"] = self.gateway_manifest(
+            container={
+                "name": "server",
+                "command": ["/usr/local/bin/openshell-gateway"],
+            }
+        )
+        self.assertTrue(cluster.release_has_gateway("custom"))
+
+    def test_unrelated_release_with_workload_is_preserved(self):
+        cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+        cluster.releases = [{"name": "other-app", "chart": "custom-1.0.0"}]
+        cluster.manifests["other-app"] = self.gateway_manifest(
+            "Deployment", {"name": "web", "image": "registry.example/web:1.0"}
+        )
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertIn("other-app", [release["name"] for release in cluster.releases])
+
+    def test_invalid_release_manifest_stops_without_echoing_content(self):
+        cluster = self.cluster()
+        cluster.manifests["custom"] = "secret: [do-not-print-this"
+        with self.assertRaisesRegex(ValueError, "Cannot inspect manifest") as caught:
+            cluster.release_has_gateway("custom")
+        self.assertNotIn("do-not-print-this", str(caught.exception))
+
     def test_conflict_on_later_release_page_is_detected(self):
         cluster = self.cluster()
         cluster.releases = [
@@ -500,6 +582,63 @@ class InstallTests(unittest.TestCase):
             any("create" in args and "can-i" not in args for args, _ in cluster.calls)
         )
 
+    def test_first_install_requires_supplied_secret_even_with_existing_secret(self):
+        for supplied in (None, "different", "matching"):
+            with self.subTest(supplied=supplied):
+                cluster = self.cluster()
+                cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+                existing = {
+                    "data": {
+                        "client-secret": base64.b64encode(b"matching").decode(),
+                        "cookie-secret": base64.b64encode(b"existing-cookie").decode(),
+                    }
+                }
+                cluster.objects[("secret", installer.OIDC_SECRET)] = copy.deepcopy(
+                    existing
+                )
+                path = Path(cluster.config["oidc"]["client_secret_file"])
+                if supplied is None:
+                    cluster.config["oidc"].pop("client_secret_file")
+                else:
+                    path.write_text(supplied)
+                before = copy.deepcopy(cluster.objects)
+                if supplied == "matching":
+                    cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+                    self.assertEqual(
+                        cluster.objects[("secret", installer.OIDC_SECRET)], existing
+                    )
+                else:
+                    expected = (
+                        "required for the first install"
+                        if supplied is None
+                        else "rotate"
+                    )
+                    with self.assertRaisesRegex(ValueError, expected):
+                        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+                    self.assertEqual(cluster.objects, before)
+
+    def test_new_namespace_preflight_checks_files_without_namespaced_reads(self):
+        (self.root / "issuer.pem").write_text("test CA")
+        self.config["oidc"]["ca_file"] = "issuer.pem"
+        cluster = self.cluster()
+        before = copy.deepcopy(cluster.objects)
+        self.assertIsNone(cluster.preflight())
+        self.assertEqual(cluster.objects, before)
+        self.assertFalse(
+            any("-n" in args and "get" in args for args, _ in cluster.calls)
+        )
+        path = Path(cluster.config["oidc"]["client_secret_file"])
+        secret = path.read_text()
+        path.write_text("\n")
+        with self.assertRaisesRegex(ValueError, "contains no secret"):
+            cluster.preflight()
+        self.assertEqual(cluster.objects, before)
+        path.write_text(secret)
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertIn(("namespace", cluster.ns), cluster.objects)
+        self.assertIn(("secret", installer.OIDC_SECRET), cluster.objects)
+        self.assertIn(("configmap", installer.OIDC_CA), cluster.objects)
+
     def test_changed_gateway_host_requires_certificate_migration(self):
         cluster = self.cluster()
         cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
@@ -516,6 +655,7 @@ class InstallTests(unittest.TestCase):
 
     def test_different_secret_is_not_silently_rotated(self):
         cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
         cluster.credentials()
         before = copy.deepcopy(cluster.objects)
         Path(cluster.config["oidc"]["client_secret_file"]).write_text("changed")
@@ -527,6 +667,7 @@ class InstallTests(unittest.TestCase):
         (self.root / "issuer.pem").write_text("test CA")
         self.config["oidc"]["ca_file"] = "issuer.pem"
         cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
         cluster.credentials()
         gateway, dashboard = installer.chart_values(cluster.config)
         self.assertEqual(
@@ -552,6 +693,7 @@ class InstallTests(unittest.TestCase):
 
     def test_route_admission_waits_and_times_out(self):
         cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
         admitted = {
             "status": {
                 "ingress": [{"conditions": [{"type": "Admitted", "status": "True"}]}]

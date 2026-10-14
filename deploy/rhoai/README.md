@@ -273,6 +273,11 @@ a different release name, or either fixed release without installer state, is
 rejected and needs explicit migration. Unmanaged gateway TLS/JWT Secrets are also
 rejected so the bootstrap hook cannot silently reuse another gateway's identity.
 Unrelated Helm releases in the selected namespace are left alone.
+Preflight inspects stored Helm workload manifests for the `openshell-gateway`
+container or executable, so renaming the chart or overriding its image does not
+bypass gateway detection. Failed releases and scaled-to-zero gateways count too.
+Custom packaging must retain one of these markers; workloads outside Helm or
+with both markers removed require administrator inspection.
 Uninstalled releases retained under another name do not count as active gateways;
 conflicting remaining TLS/JWT Secrets and fixed release names still require
 explicit migration.
@@ -287,9 +292,13 @@ rejected because the certificate hook preserves existing certificates; migrate
 the certificate and endpoint explicitly rather than editing installer state.
 
 The installer preserves existing client and cookie secrets. You may omit
-`client_secret_file` after the first installation. A provided secret or private
-OIDC CA that differs from the existing object causes an error; rotate credentials
-explicitly and restart the consuming pods. Removing `ca_file` removes the mounts
+`client_secret_file` only when installer state exists. A first installation requires
+the file even if `openshell-dashboard-oidc` already exists; the supplied client
+secret must match before that Secret is reused. Preflight validates local
+credential files without reading namespaced objects when the namespace is absent.
+A provided secret or private OIDC CA that differs from the existing object causes
+an error; rotate credentials explicitly and restart the consuming pods.
+Removing `ca_file` removes the mounts
 on the next upgrade, but does not delete the old ConfigMap.
 
 Change the pinned versions to upgrade. Both Helm releases receive the generated

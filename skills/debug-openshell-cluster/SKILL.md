@@ -101,7 +101,14 @@ does not establish dashboard login or sandbox readiness. Check the
 `openshell-installer` state ConfigMap, the dashboard OIDC Secret, the shared
 gateway CA Secret, and admission of both Routes. A gateway chart under another
 release name or an existing fixed release without installer state requires
-explicit migration; do not change state to bypass these checks. Earlier
+explicit migration; do not change state to bypass these checks. Detection also
+inspects stored Helm workloads for the `openshell-gateway` container or executable,
+including failed and scaled-to-zero releases with renamed charts. Custom packaging
+that removes both markers and workloads outside Helm require manual inspection.
+A first installation requires a client-secret file matching any existing dashboard
+OIDC Secret; only an installation with recorded state can omit the file.
+For a new namespace, credential preflight checks local files without querying
+namespaced objects before namespace creation. Earlier
 installations used namespace annotations for state, which reruns migrate while
 preserving namespace metadata. Use the published
 [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md)
