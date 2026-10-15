@@ -19,7 +19,9 @@ merges the ordered JUnit files into one `e2e-odh-<tier>.xml` plus its HTML
 companion. Phase reports remain available as
 `e2e-odh-<tier>-<phase>.xml`. The no-deploy option is supported only for
 single-phase tiers. Extracted client mTLS material is stored in a mode `0700`
-directory with mode `0600` files.
+directory with mode `0600` files. The runtime image owns its home and workspace
+as UID/GID `1001:1001`, matching the Shift-Left pipeline's
+`podman run --userns=keep-id --user 1001:1001`.
 
 Each deployed invocation has a DNS-safe run ID. During the temporary upstream
 managed-test compatibility period, the default namespace and Helm release are
