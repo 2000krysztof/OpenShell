@@ -338,11 +338,16 @@ oc login --token=XXXXXX \
 
 # Run the e2e tests
 podman run --rm \
+  --userns=keep-id --user 1001:1001 \
   -v /path/to/reports:/home/odh/openshell-e2e-odh/results:Z,U \
   -v /path/to/kubeconfig:/home/odh/openshell-e2e-odh/.kube/config:ro,Z \
   --env-file containerEnvFile \
   quay.io/opendatahub/odh-openshell-e2e:odh-stable smoke
 ```
+
+The image runs as UID/GID `1001:1001` and owns `/home/odh`, including the
+OpenShell CLI configuration directory. Keep the pipeline's `--user` setting
+at `1001:1001` so gateway registration and client mTLS material can be written.
 
 The entrypoint assigns each invocation a DNS-safe run ID. For compatibility
 with managed-workspace tests, the namespace and release default to `openshell`
