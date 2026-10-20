@@ -73,8 +73,9 @@ for phase_line in ${phase_lines}; do
 	phase_reports+=("${phase_report}")
 	rm -f "${phase_report}" "${phase_report%.xml}.html"
 done
-merged_report="${results_dir}/e2e-odh-${TIER}.xml"
-rm -f "${merged_report}" "${merged_report%.xml}.html"
+merged_report="${results_dir}/e2e-odh-${TIER}-xunit.xml"
+html_report="${results_dir}/e2e-odh-${TIER}.html"
+rm -f "${merged_report}" "${html_report}"
 
 managed_namespace_selector='openshell.ai/managed-by=openshell,openshell.ai/gateway-id=openshell'
 snapshot_managed_namespaces() {
@@ -225,7 +226,7 @@ run_child "${PYTHON_BIN}" "${MERGE_SCRIPT}" "${TIER}" "${phase_reports[@]}" || {
 }
 if [[ -f "${merged_report}" ]]; then
 	if command -v xsltproc >/dev/null 2>&1; then
-		xsltproc --stringparam title "e2e-odh-${TIER}" "${ROOT}/scripts/junit-to-html.xsl" "${merged_report}" > "${merged_report%.xml}.html" || echo "WARNING: failed to render HTML report" >&2
+		xsltproc --stringparam title "e2e-odh-${TIER}" "${ROOT}/scripts/junit-to-html.xsl" "${merged_report}" > "${html_report}" || echo "WARNING: failed to render HTML report" >&2
 	else
 		echo "WARNING: xsltproc not found; HTML report unavailable" >&2
 	fi

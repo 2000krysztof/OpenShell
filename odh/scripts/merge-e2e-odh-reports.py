@@ -48,7 +48,7 @@ def merge(tier: str, paths: list[Path], results_dir: Path) -> Path:
         root.append(suite)
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     results_dir.mkdir(parents=True, exist_ok=True)
-    xml_path = results_dir / f"e2e-odh-{tier}.xml"
+    xml_path = results_dir / f"e2e-odh-{tier}-xunit.xml"
     fd, temporary = tempfile.mkstemp(prefix=f".{xml_path.name}.", dir=results_dir)
     try:
         with os.fdopen(fd, "wb") as stream:

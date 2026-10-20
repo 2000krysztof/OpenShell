@@ -103,7 +103,12 @@ upstream_tests = ["workspace_namespace_managed"]
 
 Smoke covers gateway reachability, sandbox lifecycle, and image provenance.
 Tier 1 checks the process-supervisor SELinux label and its mapped upstream
-tests. Tier 2 runs `workspace_lifecycle`, ODH Tier 2, and image provenance in
+tests. It excludes four sandbox lifecycle tests after intermittent OpenShift
+failures: `canonical_main_disconnect_reconnect_replays_history_for_same_process`,
+`canonical_main_exit_255_is_not_retried_as_transport_failure`,
+`on_failure_policy_replaces_runtime_and_preserves_workspace`, and
+`canonical_main_and_exec_receive_declared_environment`. Full still includes all four.
+Tier 2 runs `workspace_lifecycle`, ODH Tier 2, and image provenance in
 shared mode, then runs `workspace_namespace_managed` against a separate
 managed-mode deployment. The `odh` and `full` tiers use the same shared then
 managed split. Image provenance runs once in each tier's shared phase. Smoke
@@ -252,8 +257,8 @@ image, deploying and running one phase at a time. `e2e:odh` runs all ODH
 scenarios; `e2e:odh:full` runs all feature-enabled binaries except the
 managed-only binary in its shared phase, followed by that binary in managed
 mode. Phase JUnit files are named `e2e-odh-<tier>-<phase>.xml`; the entrypoint
-merges them into `e2e-odh-<tier>.xml` and the matching HTML report in
-`results/`.
+merges them into `e2e-odh-<tier>-xunit.xml` for Jenkins discovery and
+`e2e-odh-<tier>.html` in `results/`.
 
 ### Every `e2e:odh*` task runs the image provenance check
 
@@ -393,7 +398,7 @@ use distinct values across parallel invocations. The entrypoint exports
 `OPENSHELL_E2E_RUN_ID` and the derived names so future Python test modes can
 reuse the same invocation identity. The image writes
 phase reports named `e2e-odh-<tier>-<phase>.xml`, then merges them into
-`e2e-odh-<tier>.xml` and `e2e-odh-<tier>.html` in `results/`.
+`e2e-odh-<tier>-xunit.xml` and `e2e-odh-<tier>.html` in `results/`.
 Missing phase reports are skipped, so reports from completed phases remain
 available after a later deployment or preflight failure; the task still exits
 with the failure status.
