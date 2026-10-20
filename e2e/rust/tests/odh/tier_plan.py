@@ -104,6 +104,12 @@ def load_plan(tier: str, plan_path: Path = PLAN_FILE) -> dict:
         odh_filter = phase.get("odh_filter", "")
         if not isinstance(odh_filter, str) or (odh_filter and not _FILTER.fullmatch(odh_filter)):
             raise ValueError(f"invalid ODH test filter in phase {name!r}")
+        excluded_odh_filters = phase.get("excluded_odh_filters", [])
+        if not isinstance(excluded_odh_filters, list) or any(
+            not isinstance(prefix, str) or not _FILTER.fullmatch(prefix)
+            for prefix in excluded_odh_filters
+        ):
+            raise ValueError(f"invalid excluded ODH test filter in phase {name!r}")
         for flag in ("all_binaries", "all_odh_tests", "include_image_provenance"):
             if flag in phase and not isinstance(phase[flag], bool):
                 raise ValueError(f"phase {name!r} {flag} must be a boolean")
@@ -164,11 +170,16 @@ def nextest_filter(phase: dict) -> str:
         raise ValueError(f"phase {phase['name']!r} selects no tests")
     selection = " | ".join(terms)
     global_exclusions = phase.get("global_test_exclusions", {})
-    excluded = " | ".join(
+    excluded_terms = [
         f"(binary(={binary}) & test(={test}))"
         for binary, tests in global_exclusions.items()
         for test in tests
+    ]
+    excluded_terms.extend(
+        f"(binary(=odh) & test(/^{re.escape(prefix)}/))"
+        for prefix in phase.get("excluded_odh_filters", [])
     )
+    excluded = " | ".join(excluded_terms)
     return f"({selection}) - ({excluded})" if excluded else selection
 
 

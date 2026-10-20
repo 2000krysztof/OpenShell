@@ -28,6 +28,8 @@ if [[ -z "${TIER}" || -z "${PHASE}" || -z "${REPORT}" || $# -ne 3 ]]; then
 fi
 
 resolved="$("${PYTHON_BIN}" "${SCRIPT_DIR}/tier_plan.py" "${TIER}" "${SCRIPT_DIR}/tiers.toml" "${PHASE}")"
+OPENSHELL_E2E_GATEWAY_MODE="$(printf '%s' "${resolved}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin)["phase"]["mode"])')"
+export OPENSHELL_E2E_GATEWAY_MODE
 filter="$(printf '%s' "${resolved}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin)["filter"])')"
 results_dir="${OPENSHELL_E2E_RESULTS_DIR:-${ROOT}/results}"
 mkdir -p "${results_dir}"
