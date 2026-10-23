@@ -44,10 +44,12 @@ description = "Medium/low priority positive tests"
 # Corporate proxy needs a cluster-reachable fixture configured before Helm install.
 upstream_tests = ["workspace_lifecycle"]
 odh_filter = "tier2::"
+excluded_odh_filters = ["tier2::managed_identity::"]
 
 [tier2.managed]
 description = "Managed-workspace lifecycle tests"
 upstream_tests = ["workspace_namespace_managed"]
+odh_filter = "tier2::managed_identity::"
 
 [tier3]
 description = "Negative and destructive tests"
@@ -59,11 +61,12 @@ description = "All ODH-specific tests"
 odh_only = true
 upstream_tests = []
 odh_filter = ""
+excluded_odh_filters = ["tier2::managed_identity::"]
 
 [odh.managed]
 description = "Managed-workspace tests"
 upstream_tests = ["workspace_namespace_managed"]
-odh_filter = ""
+odh_filter = "tier2::managed_identity::"
 
 [full]
 description = "All feature-enabled upstream and ODH tests except listed exclusions"
@@ -71,6 +74,7 @@ upstream_tests = []
 odh_filter = ""
 all_binaries = true
 excluded_binaries = ["workspace_namespace_managed"]
+excluded_odh_filters = ["tier2::managed_identity::"]
 
 [full.upstream_test_exclusions]
 # Full OpenShift runs identified the failures and timeouts below.
@@ -82,4 +86,4 @@ port_forward = ["port_forward_echo"]
 [full.managed]
 description = "Managed-workspace tests"
 upstream_tests = ["workspace_namespace_managed"]
-odh_filter = ""
+odh_filter = "tier2::managed_identity::"
