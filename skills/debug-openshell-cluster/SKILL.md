@@ -92,37 +92,6 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 ### Step 3: Check Gateway Startup Dependencies
 
-For an ODH gateway-and-dashboard installation, inspect both Helm releases
-(`openshell` and `openshell-dashboard`) in the administrator-selected namespace
-(`namespace` in the configuration or the `--namespace` override). Existing
-namespaces do not need an installer ownership label. The installer
-preserves partial installations and credentials on failure; gateway readiness
-does not establish dashboard login or sandbox readiness. Check the
-`openshell-installer` state ConfigMap, the dashboard OIDC Secret, the shared
-gateway CA Secret, and admission of both Routes. A gateway chart under another
-release name or an existing fixed release without installer state requires
-explicit migration; do not change state to bypass these checks. Detection also
-inspects stored Helm workloads for the `openshell-gateway` container or executable,
-including failed and scaled-to-zero releases with renamed charts. Custom packaging
-that removes both markers and workloads outside Helm require manual inspection.
-A first installation requires a client-secret file matching any existing dashboard
-OIDC Secret; only an installation with recorded state can omit the file.
-For a new namespace, credential preflight checks local files without querying
-namespaced objects before namespace creation. Earlier
-installations used namespace annotations for state, which reruns migrate while
-preserving namespace metadata. Use the published
-[Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md)
-for the installation entry point. Diagnose Agent Sandbox availability separately;
-the installer does not provision that controller or RHOAI itself.
-Its read-only preflight checks storage, installation permissions, and recorded
-OIDC identities across installer-managed namespaces. Distinct gateways need
-distinct audiences and browser clients. Legacy state without OIDC metadata needs
-manual review; retained history for another uninstalled release is not an active
-gateway. Operational values files are reapplied on every upgrade; authentication,
-TLS, naming, and namespace overrides are rejected. The deployment guide also
-provides a read-only verifier for admin/ordinary-user workspace authorization;
-it does not establish browser login, sandbox lifecycle, or network-policy enforcement.
-
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
 The gateway container uses a Distroless Debian runtime. For OS-library
@@ -1311,7 +1280,7 @@ credential failures.
 | Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
-| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
