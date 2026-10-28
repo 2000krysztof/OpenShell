@@ -28,9 +28,10 @@ a rule and the README disagree, fix the drift rather than guessing.
   and must stay that way. Keep ODH test logic out of upstream source files.
 - Keep the upstream `e2e/rust/Cargo.toml` change limited to the appended
   `e2e-odh` feature and `odh` `[[test]]` entry. The e2e image may also add
-  its nextest profile to `.config/nextest.toml` and additive integration in
-  `deploy/konflux/build-local.sh` and `.dockerignore`. Review these shared
-  files when syncing upstream. Keep the ODH build overview in
+  integration in `deploy/konflux/build-local.sh` and `.dockerignore`. Review these shared
+  files when syncing upstream. Keep the ODH nextest profile in this
+  directory's `nextest.toml`, loaded with `--tool-config-file`; do not modify
+  upstream `.config/nextest.toml`. Keep the ODH build overview in
   `deploy/konflux/e2e-odh/README.md`. Never edit the root `AGENTS.md` for
   ODH-specific rules — put them here instead.
 

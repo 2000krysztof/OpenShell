@@ -207,6 +207,7 @@ build_image() {
             nextest list --archive-file /opt/openshell/e2e-odh.tar.zst \
             --workspace-remap /home/odh/openshell-e2e-odh/e2e/rust \
             --config-file /home/odh/openshell-e2e-odh/.config/nextest.toml \
+            --tool-config-file odh:/home/odh/openshell-e2e-odh/e2e/rust/tests/odh/nextest.toml \
             --profile e2e-odh --message-format json > /dev/null
     else
         podman run --rm --platform "${PLATFORM}" "openshell-${component}-konflux" --help 2>&1 | sed -n 1,3p

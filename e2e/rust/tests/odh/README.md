@@ -32,6 +32,7 @@ e2e/rust/tests/odh/
 │   └── managed_identity.rs    # managed namespace UID/GID and process MCS isolation
 ├── tier3/                      # Tier 3: negative and destructive tests
 │   └── mod.rs                    # empty — no scenarios yet
+├── nextest.toml                # ODH profile and lifecycle serialization group
 ├── tiers.toml                  # data-only gateway modes and ordered tier phases
 ├── tier_plan.py                # validates modes, overlays, and test selectors
 └── run-odh-test-tier.sh        # runs one resolved phase against its gateway
@@ -131,6 +132,9 @@ The resolver rejects unknown modes, unsafe overlay paths, invalid selectors,
 and empty phases before any cluster change. Configuration is data-only; it
 cannot run commands.
 
+The phase runner loads the fork-only `nextest.toml` with `--tool-config-file`
+alongside the unchanged upstream `.config/nextest.toml`. The tool config supplies
+ODH defaults; repository configuration takes precedence.
 The nextest `e2e-odh` profile runs the serial sandbox lifecycle tests and
 `tier1::selinux` tests in one group with `max-threads = 1`, preserving
 serialization across nextest's separate test processes. Tier 1 and Full
@@ -201,7 +205,7 @@ context you happen to have active elsewhere. This means:
 | `mise run e2e:odh:tier1` | Tier 1: mapped upstream tests + ODH `tier1::` + image provenance |
 | `mise run e2e:odh:tier2` | Tier 2: mapped upstream tests + ODH `tier2::` + image provenance |
 | `mise run e2e:odh:tier3` | Tier 3: mapped upstream tests + ODH `tier3::` + image provenance |
-| `cargo nextest run --manifest-path e2e/rust/Cargo.toml --features e2e-odh --test odh -E 'test(=module::test_name)'` | A single ODH test function |
+| `cargo nextest run --config-file "$PWD/.config/nextest.toml" --tool-config-file "odh:$PWD/e2e/rust/tests/odh/nextest.toml" --profile e2e-odh --manifest-path e2e/rust/Cargo.toml --features e2e-odh --test odh -E 'test(=module::test_name)'` | A single ODH test function |
 
 Example, running the Smoke tier against a real cluster:
 
@@ -450,8 +454,9 @@ Konflux automation creates the Tekton YAML files for the e2e image.
 - **Fork-only paths:** this directory (`e2e/rust/tests/odh/`),
   `tasks/test-odh.toml`, the new e2e image files under
   `deploy/konflux/e2e-odh/`, `deploy/docker/`, and `odh/scripts/`.
-- **Shared files:** the image adds to `.config/nextest.toml`,
-  `deploy/konflux/build-local.sh`, and `.dockerignore`. Review these edits
+- **Shared files:** the image adds to `deploy/konflux/build-local.sh` and
+  `.dockerignore`. Keep ODH Nextest settings in this directory's `nextest.toml`
+  and leave upstream `.config/nextest.toml` unchanged. Review these edits
   whenever upstream changes those files. The fork also carries the
   `e2e-odh` feature and `odh` test entry in `e2e/rust/Cargo.toml`; preserve
   those entries when syncing upstream changes to that file.
